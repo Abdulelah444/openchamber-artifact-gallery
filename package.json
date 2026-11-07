@@ -8,7 +8,8 @@
     "build": "bun build.ts",
     "test": "bun test",
     "package": "bun package.ts",
-    "docs:build": "vitepress build docs"
+    "docs:build": "vitepress build docs",
+    "deploy": "bun build.ts && bun deploy.ts"
   },
   "openchamber": {
     "apiVersion": 1,
