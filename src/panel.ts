@@ -164,11 +164,16 @@ async function refresh(force = false) {
   clearTimeout(timer); refreshing = true;
   try {
     if (force || settings.automatic && Date.now() - lastSync > 45_000) {
-      const snapshot = await host.listProjects();
-      if (snapshot.state !== 'ready') { timer = setTimeout(() => void refresh(true), 3000); throw Error('Chargement des projets OpenChamber…'); }
-      await request('/sync', { projects: snapshot.projects, sessionId: context.session?.id, hostOrigin: location.origin }); lastSync = Date.now();
-      iconProjects = new Set(snapshot.projects.map(p => p.id));
-      projectIcons.retain(iconProjects);
+      // Project names are a nicety; the store itself supplies every session and path,
+      // so a not-yet-ready project list must not block the first collection.
+      let snapshot: Awaited<ReturnType<typeof host.listProjects>> | null = null;
+      try { snapshot = await host.listProjects(); } catch { snapshot = null; }
+      const projects = snapshot?.state === 'ready' ? snapshot.projects : [];
+      await request('/sync', { projects, sessionId: context.session?.id, hostOrigin: location.origin }); lastSync = Date.now();
+      if (snapshot && snapshot.state === 'ready') {
+        iconProjects = new Set(snapshot.projects.map(p => p.id));
+        projectIcons.retain(iconProjects);
+      } else timer = setTimeout(() => void refresh(true), 3000);
       void persistWhenSettled();
     }
     await loadIndex();
@@ -222,9 +227,14 @@ function renderContent() {
     card.dataset.id = item.id;
     thumb.dataset.id = item.id; thumb.dataset.format = item.format; thumb.append(el('span', 'placeholder', item.format)); open.setAttribute('aria-label', t('Ouvrir {title}', { title: item.title })); open.append(thumb, el('span', 'artifact-title', item.title)); open.title = item.title;
     const meta = el('div', 'artifact-meta'), time = document.createElement('time'); time.dateTime = date.toISOString(); time.textContent = date.toLocaleTimeString(locale, { hour: '2-digit', minute: '2-digit' }); time.title = date.toLocaleString(locale);
-    const session = el('span', '', item.sessionTitle); session.title = item.sessionTitle; meta.append(time, session);
-    const foot = el('div', 'artifact-foot'), source = button(spaceName(item), () => setProject(item.projectId), 'artifact-project'), add = button('+', () => void attach(item), 'quick-attach');
-    add.setAttribute('aria-label', t('Ajouter {title} au message', { title: item.title })); add.title = t('Ajouter au brouillon actif'); add.disabled = !context.session; foot.append(source, add); card.append(open, meta, foot); grid!.append(card);
+    const session = el('span', '', item.sessionArchived ? t('{title} · archivée', { title: item.sessionTitle }) : item.sessionTitle); session.title = item.sessionArchived ? t('{title} (conversation archivée)', { title: item.sessionTitle }) : item.sessionTitle; meta.append(time, session);
+    const foot = el('div', 'artifact-foot'), source = button(spaceName(item), () => setProject(item.projectId), 'artifact-project');
+    if (item.repo && item.repo !== source.textContent) { source.title = item.repo; }
+    const add = button('+', () => void attach(item), 'quick-attach');
+    add.setAttribute('aria-label', t('Ajouter {title} au message', { title: item.title })); add.title = t('Ajouter au brouillon actif'); add.disabled = !context.session;
+    foot.append(source);
+    if (!item.discovered) { const chat = button('💬', () => void host.openSession(item.sessionId).catch(report), 'quick-attach'); chat.setAttribute('aria-label', t(item.sessionArchived ? 'Ouvrir la conversation archivée' : 'Ouvrir la conversation')); chat.title = chat.getAttribute('aria-label')!; foot.append(chat); }
+    foot.append(add); card.append(open, meta, foot); grid!.append(card);
     if (settings.previews === 'visible' && (item.kind === 'page' || item.kind === 'image')) observer.observe(thumb);
   }
   const pagination = el('div', 'pagination');
@@ -278,9 +288,11 @@ function showDialog() { if (!dialog.open) dialog.showModal(); scheduleThumbnails
 async function openDetail(item: Item) {
   detail = item; dialogHeader(item.title);
   const body = el('div', 'dialog-body'), preview = el('div', 'expanded-preview'), details = el('aside', 'details'), list = el('dl');
-  for (const [label, value] of [['Espace', spaceName(item)], ['Session', item.sessionTitle], ['Création', new Date(item.createdAt).toLocaleString(locale)], ['Type', item.format], ['Origine', t(item.origin)], ['Source', item.path ?? `Message ${item.messageId}`], ['Dossier', item.directory ?? t('Inconnu')]]) list.append(el('dt', '', t(label)), el('dd', '', value));
+  for (const [label, value] of [['Espace', spaceName(item)], ['Dépôt', item.repo ?? item.directory ?? t('Inconnu')], ['Session', item.sessionArchived ? t('{title} (archivée)', { title: item.sessionTitle }) : item.sessionTitle], ['Création', new Date(item.createdAt).toLocaleString(locale)], ['Type', item.format], ['Origine', t(item.origin)], ['Source', item.path ?? (item.discovered ? t('Fichier du projet') : `Message ${item.messageId}`)]]) list.append(el('dt', '', t(label)), el('dd', '', value));
   details.append(list); mountButton(details, { label: t('Ajouter au message'), size: 'sm', disabled: !context.session, onClick: () => void attach(item) });
-  mountButton(details, { label: t('Voir la session'), variant: 'outline', size: 'sm', onClick: async () => { try { await host.openSession(item.sessionId); closeDialog(); } catch (error) { report(error); } } });
+  // Open the backing chat when one exists, archived or active; filesystem-only files have none.
+  if (!item.discovered) mountButton(details, { label: t(item.sessionArchived ? 'Ouvrir la conversation archivée' : 'Ouvrir la conversation'), variant: 'outline', size: 'sm', onClick: async () => { try { await host.openSession(item.sessionId); closeDialog(); } catch (error) { report(error); } } });
+  else details.append(el('p', 'source-note', t('Fichier trouvé dans le projet, sans conversation associée.')));
   details.append(el('p', 'source-note', context.session ? t('Destination : {title}. Seule la référence sera ajoutée.', { title: context.session.title }) : t('Ouvre une conversation pour y ajouter cette référence.')), el('p', 'source-note', t('Aperçu depuis la source. Les anciennes demandes de réponse restent désactivées.')));
   preview.append(el('p', 'source-note', t('Chargement…'))); body.append(preview, details); dialog.append(body); showDialog();
   try { await display(preview, item, true); } catch (error) { if (preview.isConnected) preview.replaceChildren(el('p', 'unavailable', t(error instanceof Error ? error.message : 'Source indisponible.'))); }

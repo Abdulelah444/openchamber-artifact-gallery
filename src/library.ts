@@ -1,18 +1,46 @@
 import { Service } from '@opencode/client/service';
-import { open } from 'node:fs/promises';
-import { basename } from 'node:path';
+import { open, readdir, stat } from 'node:fs/promises';
+import { basename, extname, join, resolve } from 'node:path';
+import { homedir } from 'node:os';
 import { createHash, randomUUID } from 'node:crypto';
 import { extractArtifacts, pageContent, previousDirectory, imageSources, pathFromSource, type Artifact } from './artifacts';
 import { boundedSnapshot, validateSnapshot, type CachedSession } from './cache';
+import { databaseReader, openChamberDatabase } from './store';
 
 type Session = CachedSession;
 type Project = { id: string; name: string; directory: string };
 type Space = { id: string; name: string; kind: 'project' | 'chats' | 'unknown' };
+const scanExtensions = new Set(['md', 'markdown', 'html', 'htm', 'pdf', 'png', 'jpg', 'jpeg', 'gif', 'webp', 'svg']);
+const skippedDirectories = new Set(['node_modules', '.git', '.svn', '.hg', 'dist', 'build', 'out', 'coverage', '.next', '.nuxt', '.cache', '.venv', 'venv', '__pycache__', 'target', 'vendor', '.venv', '.opencode', '.idea']);
 export type ReadApi = (path: string) => Promise<any>;
 export class GalleryError extends Error { constructor(public status: number, message: string) { super(message); } }
 
 const normalized = (path: string) => path.replace(/\\/g, '/').replace(/\/+$/, '') || '/';
 const within = (directory: string | null, root: string) => Boolean(directory && !directory.split(/[\\/]/).some(p => p === '.' || p === '..') && (normalized(directory) === normalized(root) || normalized(directory).startsWith(normalized(root).replace(/\/$/, '') + '/')));
+
+type DiscoveredFile = { path: string; mtime: number };
+/** Depth-first walk bounded in depth and breadth so one huge tree cannot stall a refresh. */
+async function walkArtifacts(root: string): Promise<DiscoveredFile[]> {
+  const found: DiscoveredFile[] = [];
+  let budget = 5000;
+  const visit = async (directory: string, depth: number): Promise<void> => {
+    if (depth > 12 || budget <= 0) return;
+    let entries;
+    try { entries = await readdir(directory, { withFileTypes: true }); } catch { return; }
+    for (const entry of entries) {
+      if (budget-- <= 0) return;
+      if (entry.name.startsWith('.') && entry.name !== '.') continue;
+      const full = join(directory, entry.name);
+      if (entry.isDirectory()) { if (!skippedDirectories.has(entry.name)) await visit(full, depth + 1); continue; }
+      if (!entry.isFile()) continue;
+      const extension = extname(entry.name).slice(1).toLowerCase();
+      if (!scanExtensions.has(extension)) continue;
+      try { const info = await stat(full); if (info.isFile() && info.size <= 25 * 1024 * 1024) found.push({ path: resolve(full), mtime: info.mtimeMs }); } catch { /* unreadable */ }
+    }
+  };
+  await visit(root, 0);
+  return found;
+}
 
 /** Read only the host's declared roots, never guess Chats from an unregistered project. */
 export async function readChatRoots(origin: string): Promise<string[]> {
@@ -29,7 +57,23 @@ export async function readChatRoots(origin: string): Promise<string[]> {
   return [...new Set([info.chatsRoot ?? legacy, legacy, info.canonicalChatsRoot, info.canonicalLegacyChatsRoot].filter((root): root is string => typeof root === 'string').map(normalized))];
 }
 
-export async function localReader(): Promise<ReadApi> {
+export async function localReader(options: { store?: 'database' | 'service' } = {}): Promise<ReadApi> {
+  // OpenChamber's own store is authoritative: it holds every Chat and project
+  // session, archived or active, and needs no rotating server credentials.
+  const database = options.store === 'service' ? null : openChamberDatabase();
+  if (database) {
+    try {
+      const reader = await databaseReader(database);
+      if (!reader) throw new GalleryError(503, 'Le module SQLite de Node est indisponible.');
+      return async (path) => {
+        try { return await reader.api(path); }
+        catch (error: any) {
+          if (error && error.status === 404) throw new GalleryError(404, 'La source a été supprimée ou déplacée.');
+          throw new GalleryError(502, 'Lecture du store OpenChamber impossible.');
+        }
+      };
+    } catch { /* Fall back to the standalone service below. */ }
+  }
   const endpoint = await Service.discover();
   if (!endpoint) throw new GalleryError(503, 'Le service local OpenCode est indisponible. Ouvre OpenCode puis réessaie.');
   const url = new URL(endpoint.url);
@@ -56,7 +100,7 @@ export async function scanSession(info: any, api: ReadApi): Promise<Session> {
     if (cursor && cursors.has(cursor)) throw new GalleryError(502, 'Pagination OpenCode répétée.');
     if (cursor) cursors.add(cursor);
   } while (cursor);
-  return { id: info.id, title: info.title || info.id, directory: info.location?.directory ?? null, projectId: info.projectID ?? null, updated: info.time?.updated ?? 0, artifacts };
+  return { id: info.id, title: info.title || info.id, directory: info.location?.directory ?? null, projectId: info.projectID ?? null, updated: info.time?.updated ?? 0, archived: info.archived === true || info.archivedAt != null, artifacts };
 }
 
 export class Library {
@@ -122,8 +166,58 @@ export class Library {
       } catch { this.status.failed++; }
       this.status.done++;
     }
+    // Drop sessions the store no longer lists (deleted, or left over from a previous store).
+    const live = new Set(infos.map(info => info.id));
+    for (const id of [...this.sessions.keys()]) if (!live.has(id) && !id.startsWith('fs_') && !this.sessions.get(id)?.directoryFiles) this.sessions.delete(id);
+    await this.crawlFiles();
     // Keep dead references recognisable; every preview checks its original message again.
     this.status.refreshedAt = Date.now();
+  }
+
+  /** Directories worth crawling: every known project root and Chats root. */
+  private crawlRoots() {
+    const roots = [...this.roots.values(), ...this.projects.map(p => p.directory), ...(this.chatRoots ?? [])];
+    // Only concrete project and Chats directories: never the filesystem root, the user's
+    // home, or OpenChamber's own config/data trees (those are the host, not the user's work).
+    const managed = ['/opt/openchamber/oc-config', '/opt/openchamber/oc-data', '/opt/openchamber/data/extensions', normalized('/tmp')];
+    return [...new Set(roots.map(normalized).filter(root =>
+      root && root !== '/' && root !== normalized(homedir()) && !managed.some(base => root === base || root.startsWith(base + '/'))))];
+  }
+
+  /**
+   * Files that live in a project but were never referenced in a message.
+   * They get a synthetic file-backed session so the panel can list, preview
+   * and open them without pretending a chat exists for them.
+   */
+  private async crawlFiles() {
+    // Rebuild discovered buckets each run so deleted files drop out instead of lingering.
+    for (const id of [...this.sessions.keys()]) if (id.startsWith('fs_') || this.sessions.get(id)?.directoryFiles) this.sessions.delete(id);
+    const known = new Set<string>();
+    for (const session of this.sessions.values()) for (const artifact of session.artifacts) if (artifact.path) known.add(normalized(artifact.path));
+    const discovered = new Map<string, Artifact[]>();
+    for (const root of this.crawlRoots()) {
+      for (const file of await walkArtifacts(root)) {
+        const path = normalized(file.path);
+        if (known.has(path)) continue;
+        known.add(path);
+        const format = extname(path).slice(1).toLowerCase();
+        const kind: Artifact['kind'] = ['png', 'jpg', 'jpeg', 'gif', 'webp', 'svg'].includes(format) ? 'image' : ['csv', 'tsv'].includes(format) ? 'table' : 'document';
+        const sessionId = 'fs_' + createHash('sha256').update(normalized(root)).digest('hex').slice(0, 24);
+        const artifact: Artifact = {
+          id: createHash('sha256').update(JSON.stringify(['fs', path])).digest('hex'),
+          sessionId, messageId: 'filesystem', partId: 'fs', position: 0,
+          title: basename(path), kind, format: format.toUpperCase(), origin: 'Fichier du projet',
+          createdAt: file.mtime, directory: root, path, discovered: true,
+        };
+        const bucket = discovered.get(sessionId) ?? [];
+        bucket.push(artifact); discovered.set(sessionId, bucket);
+      }
+    }
+    for (const [sessionId, artifacts] of discovered) {
+      const root = artifacts[0].directory ?? '';
+      const projectId = [...this.roots.entries()].find(([, canonical]) => normalized(canonical) === normalized(root))?.[0] ?? null;
+      this.sessions.set(sessionId, { id: sessionId, title: basename(root) || 'Fichiers', directory: root, projectId, updated: Math.max(...artifacts.map(a => a.createdAt)), archived: false, artifacts, directoryFiles: true });
+    }
   }
   private space(directory: string | null, projectId?: string | null): Space {
     if (this.chatRoots?.some(root => within(directory, root))) return { id: 'chats', name: 'Chats', kind: 'chats' };
@@ -138,8 +232,9 @@ export class Library {
     return [...this.sessions.values()].flatMap(session => session.artifacts.map(artifact => {
       const directory = artifact.directory ?? session.directory;
       const space = this.space(directory, session.projectId);
-      return { ...artifact, sessionTitle: session.title, projectId: space.id, projectName: space.name, spaceKind: space.kind };
-    })).sort((a, b) => b.createdAt - a.createdAt || a.id.localeCompare(b.id));
+      const repo = session.projectId ? this.roots.get(session.projectId) ?? null : null;
+      return { ...artifact, sessionTitle: session.title, sessionArchived: session.archived === true, repo, projectId: space.id, projectName: space.name, spaceKind: space.kind };
+    })).sort((a, b) => Number(Boolean(a.discovered)) - Number(Boolean(b.discovered)) || b.createdAt - a.createdAt || a.id.localeCompare(b.id));
   }
   index(params: URLSearchParams) {
     const scope = params.get('scope') ?? 'all', project = params.get('project') ?? 'all', kind = params.get('type') ?? 'all';
@@ -172,7 +267,14 @@ export class Library {
     return item;
   }
   async preview(id: string) {
-    const artifact = this.find(id), api = this.api ?? await this.connect();
+    const artifact = this.find(id);
+    // Filesystem-discovered files have no source message; read the file itself.
+    if (artifact.discovered) {
+      if (!artifact.path) throw new GalleryError(404, 'Source indisponible.');
+      const resource = await this.fileResource(artifact.path, artifact.kind === 'image' ? 10 * 1024 * 1024 : 20 * 1024 * 1024);
+      return { kind: artifact.kind, format: artifact.format, resource, missing: [] };
+    }
+    const api = this.api ?? await this.connect();
     const response = await api(`/api/session/${encodeURIComponent(artifact.sessionId)}/message/${encodeURIComponent(artifact.messageId)}`);
     const fresh = extractArtifacts(response.data, artifact.sessionId, artifact.directory).find(a => a.id === id);
     if (!fresh) throw new GalleryError(404, 'Cet artefact n’est plus présent dans son message source.');

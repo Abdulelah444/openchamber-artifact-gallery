@@ -6,6 +6,8 @@ export type Artifact = {
   id: string; sessionId: string; messageId: string; partId: string; position: number;
   title: string; kind: 'page' | 'image' | 'document' | 'table'; format: string;
   origin: string; createdAt: number; directory: string | null; path?: string; attachment?: boolean;
+  /** Found by the filesystem crawl rather than referenced in a message. */
+  discovered?: boolean;
 };
 const imageExtensions = new Set(['png', 'jpg', 'jpeg', 'gif', 'webp', 'svg']);
 const documentExtensions = new Set(['md', 'txt', 'pdf', 'html', 'htm', 'docx', 'xlsx', 'pptx', 'csv', 'tsv']);

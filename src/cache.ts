@@ -1,6 +1,6 @@
 import type { Artifact } from './artifacts';
 
-export type CachedSession = { id: string; title: string; directory: string | null; projectId: string | null; updated: number; artifacts: Artifact[] };
+export type CachedSession = { id: string; title: string; directory: string | null; projectId: string | null; updated: number; archived: boolean; directoryFiles?: boolean; artifacts: Artifact[] };
 export type Snapshot = { version: 1; sessions: CachedSession[] };
 // Two generations, JSON escaping and preferences must fit below the host's 2 MiB quota.
 export const CACHE_BYTES = 400 * 1024, CHUNK_BYTES = 48 * 1024;
@@ -15,14 +15,14 @@ export function validateSnapshot(value: any): Snapshot {
   if (!value || value.version !== 1 || !Array.isArray(value.sessions) || jsonBytes(value) > CACHE_BYTES) throw Error('Invalid cache');
   const ids = new Set<string>();
   for (const s of value.sessions) {
-    if (!s || !text(s.id) || !/^ses_[\w-]+$/.test(s.id) || ids.has(s.id) || !text(s.title) || !nullable(s.directory) || !nullable(s.projectId) || !timestamp(s.updated) || !Array.isArray(s.artifacts)) throw Error('Invalid cached session');
+    if (!s || !text(s.id) || !/^(?:ses_|fs_)[\w-]+$/.test(s.id) || ids.has(s.id) || !text(s.title) || !nullable(s.directory) || !nullable(s.projectId) || !timestamp(s.updated) || !Array.isArray(s.artifacts) || (s.archived !== undefined && typeof s.archived !== 'boolean') || (s.directoryFiles !== undefined && typeof s.directoryFiles !== 'boolean')) throw Error('Invalid cached session');
     ids.add(s.id);
     for (const a of s.artifacts) {
-      if (!a || !text(a.id) || !/^[a-f0-9]{64}$/.test(a.id) || a.sessionId !== s.id || !text(a.messageId) || !text(a.partId) || !Number.isSafeInteger(a.position) || a.position < 0 || !text(a.title) || !['page', 'image', 'document', 'table'].includes(a.kind) || !text(a.format) || !text(a.origin) || !timestamp(a.createdAt) || !nullable(a.directory) || a.path !== undefined && !text(a.path) || a.attachment !== undefined && typeof a.attachment !== 'boolean') throw Error('Invalid cached artifact');
+      if (!a || !text(a.id) || !/^[a-f0-9]{64}$/.test(a.id) || a.sessionId !== s.id || !text(a.messageId) || !text(a.partId) || !Number.isSafeInteger(a.position) || a.position < 0 || !text(a.title) || !['page', 'image', 'document', 'table'].includes(a.kind) || !text(a.format) || !text(a.origin) || !timestamp(a.createdAt) || !nullable(a.directory) || a.path !== undefined && !text(a.path) || a.attachment !== undefined && typeof a.attachment !== 'boolean' || a.discovered !== undefined && typeof a.discovered !== 'boolean') throw Error('Invalid cached artifact');
     }
   }
   // Strip unknown fields: a cache must never become a second source-content store.
-  return { version: 1, sessions: value.sessions.map((s: CachedSession) => ({ id: s.id, title: s.title, directory: s.directory, projectId: s.projectId, updated: s.updated, artifacts: s.artifacts.map(a => ({ id: a.id, sessionId: a.sessionId, messageId: a.messageId, partId: a.partId, position: a.position, title: a.title, kind: a.kind, format: a.format, origin: a.origin, createdAt: a.createdAt, directory: a.directory, ...(a.path === undefined ? {} : { path: a.path }), ...(a.attachment === undefined ? {} : { attachment: a.attachment }) })) })) };
+  return { version: 1, sessions: value.sessions.map((s: CachedSession) => ({ id: s.id, title: s.title, directory: s.directory, projectId: s.projectId, updated: s.updated, ...(s.archived ? { archived: true } : {}), ...(s.directoryFiles ? { directoryFiles: true } : {}), artifacts: s.artifacts.map(a => ({ id: a.id, sessionId: a.sessionId, messageId: a.messageId, partId: a.partId, position: a.position, title: a.title, kind: a.kind, format: a.format, origin: a.origin, createdAt: a.createdAt, directory: a.directory, ...(a.path === undefined ? {} : { path: a.path }), ...(a.attachment === undefined ? {} : { attachment: a.attachment }), ...(a.discovered ? { discovered: true } : {}) })) })) };
 }
 
 export function boundedSnapshot(sessions: Iterable<CachedSession>): Snapshot {
