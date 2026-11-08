@@ -344,6 +344,9 @@ async function showDownloadLink(blob: Blob, name: string, label: string) {
   const href = `data:${blob.type || 'application/octet-stream'};base64,${await blobToBase64(blob)}`;
   const link = document.createElement('a');
   link.href = href; link.download = name; link.className = 'download-link';
+  // Opening in a new tab lets the download escape the sandboxed frame's
+  // navigation rules (Firefox-family refuses an in-frame download otherwise).
+  link.target = '_blank';
   link.textContent = t('Télécharger {name}', { name });
   link.title = `${name} · ${formatSize(blob.size)}`;
   const dismiss = button('✕', () => { downloadBar.hidden = true; downloadBar.replaceChildren(); }, 'plain-button icon-button');
