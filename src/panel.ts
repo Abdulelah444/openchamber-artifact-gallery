@@ -300,14 +300,6 @@ function fileName(item: Item) {
  * reaches the user's disk when the host grants `allow-downloads`; we cannot
  * observe the result, so the caller must not claim more than "asked the browser".
  */
-function saveBlob(blob: Blob, name: string): boolean {
-  if (!blob.size) return false;
-  const url = URL.createObjectURL(blob), link = document.createElement('a');
-  link.href = url; link.download = name; link.rel = 'noopener'; document.body.append(link); link.click(); link.remove();
-  // Long enough for the browser to start the transfer, short enough to free memory.
-  setTimeout(() => URL.revokeObjectURL(url), 60_000);
-  return true;
-}
 /** Fetch one artifact's bytes exactly as the preview does, without a live view to cancel. */
 async function artifactBytes(item: Item): Promise<Blob> {
   // Errors propagate so the button can say why instead of pretending the file is empty.
@@ -338,19 +330,35 @@ function zip(files: { name: string; blob: Blob }[], payloads: Uint8Array[]): Blo
   const directory = new Blob(central), end = new Uint8Array([0x50, 0x4b, 0x05, 0x06, ...u16(0), ...u16(0), ...u16(files.length), ...u16(files.length), ...u32(directory.size), ...u32(offset), ...u16(0)]);
   return new Blob([...entries, directory, end], { type: 'application/zip' });
 }
-/** The link the user presses: a gesture browsers never block, unlike a script's click. */
-function showDownloadLink(blob: Blob, name: string, label: string) {
-  const url = URL.createObjectURL(blob), link = document.createElement('a');
-  link.href = url; link.download = name; link.className = 'download-link'; link.rel = 'noopener';
+/**
+ * The link the user presses: a gesture browsers never block, unlike a script's
+ * click. It points at a data: URL rather than a blob: URL — a blob from this
+ * sandboxed frame is `blob:null/…`, which Chrome permits but Safari refuses
+ * outright (the exact "nothing happens" seen in Firefox-family browsers too).
+ */
+// data: URLs hold the whole payload in the URL string; beyond this the base64
+// becomes larger than browsers reliably handle, so such files refuse politely.
+const MAX_DATA_URL_BYTES = 8 * 1024 * 1024;
+
+async function showDownloadLink(blob: Blob, name: string, label: string) {
+  const href = `data:${blob.type || 'application/octet-stream'};base64,${await blobToBase64(blob)}`;
+  const link = document.createElement('a');
+  link.href = href; link.download = name; link.className = 'download-link';
   link.textContent = t('Télécharger {name}', { name });
   link.title = `${name} · ${formatSize(blob.size)}`;
-  const dismiss = button('✕', () => { URL.revokeObjectURL(url); downloadBar.hidden = true; downloadBar.replaceChildren(); }, 'plain-button icon-button');
+  const dismiss = button('✕', () => { downloadBar.hidden = true; downloadBar.replaceChildren(); }, 'plain-button icon-button');
   dismiss.setAttribute('aria-label', t('Fermer'));
   downloadBar.replaceChildren(el('span', 'download-hint', label), link, dismiss);
   downloadBar.hidden = false;
   link.focus({ preventScroll: true });
-  // Free the blob if the bar is still up when it is replaced later.
-  setTimeout(() => { if (!link.isConnected) URL.revokeObjectURL(url); }, 10 * 60_000);
+}
+function blobToBase64(blob: Blob): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => { const result = String(reader.result); resolve(result.slice(result.indexOf(',') + 1)); };
+    reader.onerror = () => reject(reader.error);
+    reader.readAsDataURL(blob);
+  });
 }
 function formatSize(bytes: number) {
   if (bytes < 1024) return `${bytes} ${t('o')}`;
@@ -362,7 +370,8 @@ async function downloadOne(item: Item) {
   try {
     const blob = await artifactBytes(item);
     if (!blob.size) { report(Error(t('Cet artefact est vide.'))); return; }
-    showDownloadLink(blob, fileName(item), t('Prêt : clique le lien pour enregistrer le fichier.'));
+    if (blob.size > MAX_DATA_URL_BYTES) { report(Error(t('Ce fichier est trop volumineux pour ce téléchargement ({size}).', { size: formatSize(blob.size) }))); return; }
+    await showDownloadLink(blob, fileName(item), t('Prêt : clique le lien pour enregistrer le fichier.'));
   } catch (error) { report(error); }
 }
 async function downloadSelected() {
@@ -371,7 +380,8 @@ async function downloadSelected() {
     if (picked.length === 1) {
       const blob = await artifactBytes(picked[0]);
       if (!blob.size) { report(Error(t('Cet artefact est vide.'))); return; }
-      showDownloadLink(blob, fileName(picked[0]), t('Prêt : clique le lien pour enregistrer le fichier.'));
+      if (blob.size > MAX_DATA_URL_BYTES) { report(Error(t('Ce fichier est trop volumineux pour ce téléchargement ({size}).', { size: formatSize(blob.size) }))); return; }
+      await showDownloadLink(blob, fileName(picked[0]), t('Prêt : clique le lien pour enregistrer le fichier.'));
       return;
     }
     const files: { name: string; blob: Blob }[] = [], payloads: Uint8Array[] = [];
@@ -382,7 +392,9 @@ async function downloadSelected() {
     }
     if (!files.length) { report(Error(t('Téléchargement impossible pour cet artefact.'))); return; }
     const archive = `galerie-${new Date().toISOString().slice(0, 10)}.zip`;
-    showDownloadLink(zip(files, payloads), archive, t('Archive de {count} fichiers prête : clique le lien pour enregistrer.', { count: files.length }));
+    const zipped = zip(files, payloads);
+    if (zipped.size > MAX_DATA_URL_BYTES) { report(Error(t('Cette archive est trop volumineuse pour ce téléchargement ({size}).', { size: formatSize(zipped.size) }))); return; }
+    await showDownloadLink(zipped, archive, t('Archive de {count} fichiers prête : clique le lien pour enregistrer.', { count: files.length }));
   } catch (error) { report(error); }
 }
 /**

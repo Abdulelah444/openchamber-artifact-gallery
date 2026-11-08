@@ -98,6 +98,8 @@ const english: Record<string, string> = {
   'Télécharger {name}': 'Download {name}',
   'Archive de {count} fichiers prête : clique le lien pour enregistrer.': 'Archive of {count} files ready: click the link to save.',
   'o': 'B', 'Ko': 'KB', 'Mo': 'MB',
+  'Ce fichier est trop volumineux pour ce téléchargement ({size}).': 'This file is too large for this download ({size}).',
+  'Cette archive est trop volumineuse pour ce téléchargement ({size}).': 'This archive is too large for this download ({size}).',
   'Cet artefact est vide.': 'This artifact is empty.',
   'Téléchargement impossible pour cet artefact.': 'Cannot download this artifact.',
   '{count} fichier(s) téléchargé(s).': '{count} file(s) downloaded.', 'Archive ZIP': 'ZIP archive',
