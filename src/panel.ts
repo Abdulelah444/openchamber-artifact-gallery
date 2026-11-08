@@ -4,6 +4,7 @@ import { fontCss, previewDocument, previewThemeMessage } from './preview';
 import type { Library } from './library';
 import { locale, setLocale, t, type Language } from './locale';
 import { chunksFor, readCache, persistCache, withCacheLease } from './cache';
+import { isGalleryHostname } from './origin';
 import { ProjectIcons } from './project-icons';
 
 type Item = ReturnType<Library['list']>[number];
@@ -354,7 +355,7 @@ host.onReady(ready => {
       if (saved && typeof saved === 'object' && !Array.isArray(saved)) settings = { previews: saved.previews === 'manual' ? 'manual' : 'visible', density: saved.density === 'compact' ? 'compact' : 'comfortable', pageSize: saved.pageSize === 24 ? 24 : 12, automatic: saved.automatic !== false, projectIcons: saved.projectIcons !== false, language: saved.language === 'en' || saved.language === 'fr' ? saved.language : 'auto' };
     } catch (error) { storageError = error; }
     updateLanguage(); scope = context.session ? 'session' : 'all'; mount();
-    if (!['127.0.0.1', 'localhost', '[::1]'].includes(location.hostname)) { errorLine.textContent = t('Cette version de la galerie fonctionne sur l’instance locale OpenChamber.'); return; }
+    if (!isGalleryHostname(location.hostname)) { errorLine.textContent = t('Cette version de la galerie fonctionne sur l’instance locale OpenChamber.'); return; }
     try {
       await withCacheStorage(async (storage, owner, renew) => {
         const saved = await readCache(storage);

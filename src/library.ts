@@ -6,6 +6,10 @@ import { createHash, randomUUID } from 'node:crypto';
 import { extractArtifacts, pageContent, previousDirectory, imageSources, pathFromSource, type Artifact } from './artifacts';
 import { boundedSnapshot, validateSnapshot, type CachedSession } from './cache';
 import { databaseReader, openChamberDatabase } from './store';
+import { isGalleryHostname, ownHostnames } from './origin';
+import os from 'node:os';
+
+const own = ownHostnames(os);
 
 type Session = CachedSession;
 type Project = { id: string; name: string; directory: string };
@@ -45,7 +49,7 @@ async function walkArtifacts(root: string): Promise<DiscoveredFile[]> {
 /** Read only the host's declared roots, never guess Chats from an unregistered project. */
 export async function readChatRoots(origin: string): Promise<string[]> {
   const url = new URL(origin);
-  if (!['http:', 'https:'].includes(url.protocol) || !['127.0.0.1', 'localhost', '[::1]'].includes(url.hostname) || url.username || url.password || url.origin !== origin) throw new GalleryError(400, 'Adresse locale OpenChamber invalide.');
+  if (!['http:', 'https:'].includes(url.protocol) || !isGalleryHostname(url.hostname, own) || url.username || url.password || url.origin !== origin) throw new GalleryError(400, 'Adresse locale OpenChamber invalide.');
   const response = await fetch(new URL('/api/fs/home', url), { redirect: 'error', signal: AbortSignal.timeout(3000) });
   if (!response.ok) throw Error('Chats root unavailable');
   const text = await response.text();

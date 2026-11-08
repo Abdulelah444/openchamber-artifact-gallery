@@ -2,6 +2,10 @@ import http from 'node:http';
 import { timingSafeEqual } from 'node:crypto';
 import { Library, GalleryError } from './library';
 import { CACHE_BYTES, CHUNK_BYTES, jsonBytes } from './cache';
+import { isGalleryHostname, ownHostnames } from './origin';
+import os from 'node:os';
+
+const own = ownHostnames(os);
 import { readProjectIcon } from './project-icon';
 
 const port = Number(process.env.OPENCHAMBER_SERVICE_PORT), token = process.env.OPENCHAMBER_SERVICE_TOKEN;
@@ -65,7 +69,8 @@ const server = http.createServer(async (req, res) => {
       for await (const chunk of req.iterator({ destroyOnReturn: false })) { size += chunk.length; if (size > 64_000) throw new GalleryError(413, 'Requête trop volumineuse.'); chunks.push(chunk); }
       let body;
       try { body = JSON.parse(Buffer.concat(chunks).toString()); } catch { throw new GalleryError(400, 'Requête invalide.'); }
-      if (!body || !Array.isArray(body.projects) || body.projects.length > 200 || body.projects.some((p: any) => !p || ['id', 'name', 'directory'].some(k => typeof p[k] !== 'string' || p[k].length > 2048)) || body.sessionId && !/^ses_[a-zA-Z0-9_-]+$/.test(body.sessionId) || body.hostOrigin !== undefined && (typeof body.hostOrigin !== 'string' || !/^https?:\/\/(127\.0\.0\.1|localhost|\[::1\])(:[0-9]+)?$/.test(body.hostOrigin))) throw new GalleryError(400, 'Projets, session ou hôte invalides.');
+      const hostInvalid = body.hostOrigin !== undefined && (typeof body.hostOrigin !== 'string' || !/^https?:\/\//.test(body.hostOrigin) || (() => { try { const o = new URL(body.hostOrigin); return o.origin !== body.hostOrigin || o.username || o.password || !isGalleryHostname(o.hostname, own); } catch { return true; } })());
+      if (!body || !Array.isArray(body.projects) || body.projects.length > 200 || body.projects.some((p: any) => !p || ['id', 'name', 'directory'].some(k => typeof p[k] !== 'string' || p[k].length > 2048)) || body.sessionId && !/^ses_[a-zA-Z0-9_-]+$/.test(body.sessionId) || hostInvalid) throw new GalleryError(400, 'Projets, session ou hôte invalides.');
       iconOrigin = body.hostOrigin ?? ''; iconProjects = new Set(body.projects.map((p: any) => p.id));
       await library.sync(body.projects.map(({ id, name, directory }: any) => ({ id, name, directory })), body.sessionId, body.hostOrigin);
       return reply(res, 202, { status: library.status });

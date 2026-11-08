@@ -136,7 +136,7 @@ test('Chats roots come from the local host, including canonical aliases, without
   } });
   try {
     expect(await readChatRoots(server.url.origin)).toEqual(['/custom/chats', '/home/user/.config/openchamber/chats', '/disk/chats', '/disk/legacy']);
-    await expect(readChatRoots('https://example.org')).rejects.toThrow('locale');
+    await expect(readChatRoots('https://8.8.8.8')).rejects.toThrow('locale');
     await expect(readChatRoots(server.url.origin + '/another-route')).rejects.toThrow('locale');
   } finally { server.stop(true); }
 });
