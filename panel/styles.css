@@ -53,6 +53,10 @@ h1,h2,p{margin:0}h1,h2{font-size:var(--text-ui-header);font-weight:500}h1{flex:1
 .artifact.selected .thumbnail{outline:2px solid var(--oc-selection);outline-offset:2px}
 .artifact.is-hidden{opacity:.55}.hidden-badge{display:inline-block;margin-top:.25rem;padding:.0625rem .375rem;border-radius:999px;background:var(--oc-elevated);color:var(--oc-muted);font-size:var(--text-micro)}
 .artifact-tools{display:flex;align-items:center;gap:.1875rem}
+.download-bar{display:flex;flex-wrap:wrap;align-items:center;gap:.5rem .75rem;padding:.5rem .625rem;margin-bottom:.75rem;border-radius:var(--gallery-radius);background:var(--oc-selection);color:var(--oc-selection-fg);font-size:var(--text-ui-label)}
+.download-hint{color:var(--oc-selection-fg);opacity:.85}
+.download-link{display:inline-flex;align-items:center;gap:.375rem;padding:.4375rem .75rem;border-radius:var(--gallery-radius-sm);background:var(--oc-primary);color:var(--oc-primary-foreground,var(--oc-bg));font-weight:500;text-decoration:none;overflow-wrap:anywhere}
+.download-link:hover{filter:brightness(1.08)}.download-bar .icon-button{margin-left:auto;color:inherit}
 .confirm-dialog{border:0;border-radius:var(--gallery-radius);background:var(--oc-bg);color:var(--oc-fg);max-width:26rem;padding:0}.confirm-dialog::backdrop{background:rgb(0 0 0 / .45)}
 .confirm-body{padding:1.125rem 1.25rem;display:flex;flex-direction:column;gap:.625rem}.confirm-body h2{font-size:var(--text-ui-header);font-weight:600}.confirm-body p{font-size:var(--text-ui-label);line-height:1.6;color:var(--oc-muted)}
 .confirm-actions{display:flex;justify-content:flex-end;gap:.5rem;margin-top:.375rem}.confirm-accept{border:0;border-radius:var(--gallery-radius-sm);padding:.4375rem .75rem;background:var(--oc-error-text);color:var(--oc-bg);font-size:var(--text-ui-label)}

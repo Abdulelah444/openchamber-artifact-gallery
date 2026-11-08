@@ -65,6 +65,7 @@ const exploreButton = button('Explorer', () => projectMenu.showPopover(), 'plain
 projectMenu.addEventListener('toggle', () => renderSpaces(projectMenu));
 let search: ReturnType<typeof mountSearchField>, typePicker: ReturnType<typeof mountSelect>, sortPicker: ReturnType<typeof mountSelect>, settingsButton: ReturnType<typeof mountButton>, refreshButton: ReturnType<typeof mountButton>;
 const selectionBar = el('div', 'selection-bar');
+const downloadBar = el('div', 'download-bar'); downloadBar.hidden = true; downloadBar.setAttribute('role', 'status');
 const selectButton = button('Sélectionner', () => toggleSelecting(), 'plain-button select-button');
 const hiddenButton = button('Afficher les masqués', () => { showHidden = !showHidden; page = 1; changeView(); }, 'plain-button hidden-toggle');
 const sortOptions = [
@@ -156,7 +157,7 @@ function mount() {
   typeSlot.querySelector('button')?.setAttribute('aria-label', 'Filtrer par type');
   sortPicker = mountSelect(sortSlot, { value: sort, options: sortOptions.map(option => ({ ...option })), onChange(value) { sort = value as typeof sort; sortPicker.update({ value }); selected.clear(); changeView(); } });
   sortSlot.querySelector('button')?.setAttribute('aria-label', 'Trier les artefacts');
-  work.append(controls, selectionBar, notice, errorLine, content); layout.append(explorer, work);
+  work.append(controls, selectionBar, downloadBar, notice, errorLine, content); layout.append(explorer, work);
   app.replaceChildren(header, scopes, scopeContext, layout, destination, projectMenu, dialog); mounted = true; renderChrome();
 }
 async function loadIndex() {
@@ -279,11 +280,20 @@ function renderSelectionBar() {
   close.setAttribute('aria-label', t('Annuler la sélection'));
   selectionBar.append(allButton, download, remove, attachAll, close);
 }
+/**
+ * A download name every browser keeps as-is. Titles are prose ("Conjure live
+ * draw — mockup"), so non-ASCII punctuation becomes a hyphen: a name the
+ * browser cannot normalise is silently replaced with "download".
+ */
 function fileName(item: Item) {
-  const base = (item.path ? item.path.split(/[\\/]/).pop() : item.title) || item.title;
-  const safe = base.replace(/[\\/:*?"<>|]+/g, '-').replace(/\s+/g, ' ').trim().slice(0, 120) || 'artifact';
-  const ext = /\.[a-z0-9]{1,8}$/i.test(safe) ? '' : '.' + (item.format || 'bin').toLowerCase();
-  return safe + ext;
+  const raw = (item.path ? item.path.split(/[\\/]/).pop() : item.title) || item.title || 'artifact';
+  const base = raw
+    .normalize('NFKD').replace(/[\u0300-\u036f]/g, '')
+    .replace(/[^\w.\- ]+/g, '-')
+    .replace(/[\s-]+/g, '-').replace(/^[-.]+|[-.]+$/g, '')
+    .slice(0, 100) || 'artifact';
+  const ext = /\.[a-z0-9]{1,8}$/i.test(base) ? '' : '.' + (item.format || 'bin').toLowerCase();
+  return base + ext;
 }
 /**
  * Hand bytes to the browser as a download. The panel is sandboxed, so this only
@@ -299,16 +309,15 @@ function saveBlob(blob: Blob, name: string): boolean {
   return true;
 }
 /** Fetch one artifact's bytes exactly as the preview does, without a live view to cancel. */
-async function artifactBytes(item: Item): Promise<Blob | null> {
-  try {
-    const preview = await request('/preview?id=' + item.id);
-    if (preview.kind === 'page') {
-      let html: string = preview.html;
-      for (const image of preview.images) html = html.split(image.source).join(await dataUrl(await bytes(image, () => true)));
-      return new Blob([html], { type: 'text/html' });
-    }
-    return await bytes(preview.resource, () => true);
-  } catch { return null; }
+async function artifactBytes(item: Item): Promise<Blob> {
+  // Errors propagate so the button can say why instead of pretending the file is empty.
+  const preview = await request('/preview?id=' + item.id);
+  if (preview.kind === 'page') {
+    let html: string = preview.html;
+    for (const image of preview.images) html = html.split(image.source).join(await dataUrl(await bytes(image, () => true)));
+    return new Blob([html], { type: 'text/html' });
+  }
+  return await bytes(preview.resource, () => true);
 }
 // One dependency-free ZIP (store only): a multi-file selection is a single browser download.
 function zip(files: { name: string; blob: Blob }[], payloads: Uint8Array[]): Blob {
@@ -329,25 +338,51 @@ function zip(files: { name: string; blob: Blob }[], payloads: Uint8Array[]): Blo
   const directory = new Blob(central), end = new Uint8Array([0x50, 0x4b, 0x05, 0x06, ...u16(0), ...u16(0), ...u16(files.length), ...u16(files.length), ...u32(directory.size), ...u32(offset), ...u16(0)]);
   return new Blob([...entries, directory, end], { type: 'application/zip' });
 }
+/** The link the user presses: a gesture browsers never block, unlike a script's click. */
+function showDownloadLink(blob: Blob, name: string, label: string) {
+  const url = URL.createObjectURL(blob), link = document.createElement('a');
+  link.href = url; link.download = name; link.className = 'download-link'; link.rel = 'noopener';
+  link.textContent = t('Télécharger {name}', { name });
+  link.title = `${name} · ${formatSize(blob.size)}`;
+  const dismiss = button('✕', () => { URL.revokeObjectURL(url); downloadBar.hidden = true; downloadBar.replaceChildren(); }, 'plain-button icon-button');
+  dismiss.setAttribute('aria-label', t('Fermer'));
+  downloadBar.replaceChildren(el('span', 'download-hint', label), link, dismiss);
+  downloadBar.hidden = false;
+  link.focus({ preventScroll: true });
+  // Free the blob if the bar is still up when it is replaced later.
+  setTimeout(() => { if (!link.isConnected) URL.revokeObjectURL(url); }, 10 * 60_000);
+}
+function formatSize(bytes: number) {
+  if (bytes < 1024) return `${bytes} ${t('o')}`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(bytes < 10240 ? 1 : 0)} ${t('Ko')}`;
+  return `${(bytes / (1024 * 1024)).toFixed(1)} ${t('Mo')}`;
+}
+/** One artifact from its own button, without disturbing the current selection. */
+async function downloadOne(item: Item) {
+  try {
+    const blob = await artifactBytes(item);
+    if (!blob.size) { report(Error(t('Cet artefact est vide.'))); return; }
+    showDownloadLink(blob, fileName(item), t('Prêt : clique le lien pour enregistrer le fichier.'));
+  } catch (error) { report(error); }
+}
 async function downloadSelected() {
   const picked = selectedItems(); if (!picked.length) return;
   try {
     if (picked.length === 1) {
-      const blob = await artifactBytes(picked[0]); if (!blob) { report(Error(t('Téléchargement impossible pour cet artefact.'))); return; }
-      const name = fileName(picked[0]);
-      if (!saveBlob(blob, name)) { report(Error(t('Cet artefact est vide.'))); return; }
-      notice.textContent = t('Envoi de {name} au navigateur.', { name });
+      const blob = await artifactBytes(picked[0]);
+      if (!blob.size) { report(Error(t('Cet artefact est vide.'))); return; }
+      showDownloadLink(blob, fileName(picked[0]), t('Prêt : clique le lien pour enregistrer le fichier.'));
       return;
     }
     const files: { name: string; blob: Blob }[] = [], payloads: Uint8Array[] = [];
     for (const item of picked) {
-      const blob = await artifactBytes(item); if (!blob) continue;
+      const blob = await artifactBytes(item).catch(() => null);
+      if (!blob?.size) continue;
       files.push({ name: fileName(item), blob }); payloads.push(new Uint8Array(await blob.arrayBuffer()));
     }
     if (!files.length) { report(Error(t('Téléchargement impossible pour cet artefact.'))); return; }
     const archive = `galerie-${new Date().toISOString().slice(0, 10)}.zip`;
-    if (!saveBlob(zip(files, payloads), archive)) { report(Error(t('Cet artefact est vide.'))); return; }
-    notice.textContent = t('Envoi de {name} au navigateur ({count} fichiers).', { name: archive, count: files.length });
+    showDownloadLink(zip(files, payloads), archive, t('Archive de {count} fichiers prête : clique le lien pour enregistrer.', { count: files.length }));
   } catch (error) { report(error); }
 }
 /**
@@ -453,7 +488,7 @@ function renderContent() {
       const chat = button('💬', () => void host.openSession(item.sessionId).catch(report), 'quick-attach');
       chat.setAttribute('aria-label', t(item.sessionArchived ? 'Go to the archived chat' : 'Go to chat')); chat.title = chat.getAttribute('aria-label')!; tools.append(chat);
     }
-    const download = button('⤓', () => { selected.clear(); selected.add(item.id); void downloadSelected().finally(() => selected.clear()); }, 'quick-attach');
+    const download = button('⤓', () => void downloadOne(item), 'quick-attach');
     download.setAttribute('aria-label', t('Télécharger')); download.title = t('Télécharger'); tools.append(download);
     const trash = button(isHidden ? '↺' : '🗑', () => void (isHidden ? restoreOne(item) : deleteOne(item)), 'quick-attach');
     trash.setAttribute('aria-label', t(isHidden ? 'Restaurer' : 'Supprimer')); trash.title = trash.getAttribute('aria-label')!; tools.append(trash);
@@ -518,7 +553,7 @@ async function openDetail(item: Item) {
   // Open the backing chat when one exists, archived or active; filesystem-only files have none.
   if (!item.discovered) mountButton(details, { label: t(item.sessionArchived ? 'Go to the archived chat' : 'Go to chat'), variant: 'outline', size: 'sm', onClick: async () => { try { await host.openSession(item.sessionId); closeDialog(); } catch (error) { report(error); } } });
   else details.append(el('p', 'source-note', t('Fichier trouvé dans le projet, sans conversation associée.')));
-  mountButton(details, { label: t('Télécharger'), variant: 'outline', size: 'sm', onClick: () => { selected.clear(); selected.add(item.id); void downloadSelected().finally(() => selected.clear()); } });
+  mountButton(details, { label: t('Télécharger'), variant: 'outline', size: 'sm', onClick: () => void downloadOne(item) });
   mountButton(details, { label: t('Supprimer'), variant: 'outline', size: 'sm', onClick: async () => { await deleteOne(item); } });
   details.append(el('p', 'source-note', context.session ? t('Destination : {title}. Seule la référence sera ajoutée.', { title: context.session.title }) : t('Ouvre une conversation pour y ajouter cette référence.')), el('p', 'source-note', t('Aperçu depuis la source. Les anciennes demandes de réponse restent désactivées.')));
   preview.append(el('p', 'source-note', t('Chargement…'))); body.append(preview, details); dialog.append(body); showDialog();

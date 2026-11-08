@@ -94,8 +94,10 @@ const english: Record<string, string> = {
   'Restaurer': 'Restore', 'Restaurer {count} artefact(s) ?': 'Restore {count} artifact(s)?',
   '{count} restauré(s).': '{count} restored.', 'Élément masqué': 'Hidden item',
   // Download
-  'Envoi de {name} au navigateur.': 'Sending {name} to the browser.',
-  'Envoi de {name} au navigateur ({count} fichiers).': 'Sending {name} to the browser ({count} files).',
+  'Prêt : clique le lien pour enregistrer le fichier.': 'Ready: click the link to save the file.',
+  'Télécharger {name}': 'Download {name}',
+  'Archive de {count} fichiers prête : clique le lien pour enregistrer.': 'Archive of {count} files ready: click the link to save.',
+  'o': 'B', 'Ko': 'KB', 'Mo': 'MB',
   'Cet artefact est vide.': 'This artifact is empty.',
   'Téléchargement impossible pour cet artefact.': 'Cannot download this artifact.',
   '{count} fichier(s) téléchargé(s).': '{count} file(s) downloaded.', 'Archive ZIP': 'ZIP archive',

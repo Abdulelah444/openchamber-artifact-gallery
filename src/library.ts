@@ -119,6 +119,8 @@ export class Library {
   projects: Project[] = [];
   private roots = new Map<string, string>();
   private chatRoots: string[] | null = null;
+  /** Host origin whose Chats roots were already attempted; failures are not retried. */
+  private chatOrigin = '';
   private classifying = false;
   classificationWarning = '';
   status = { running: false, done: 0, total: 0, failed: 0, error: '', refreshedAt: 0 };
@@ -150,8 +152,10 @@ export class Library {
     if (this.job || this.classifying) return;
     this.classifying = true;
     try {
-      if (hostOrigin) {
-        try { this.chatRoots = await this.readChats(hostOrigin); this.classificationWarning = ''; }
+      // Read the Chats roots once per host origin: a refused /api/fs/home does not
+      // change, so retrying every poll only repeats the same warning.
+      if (hostOrigin && hostOrigin !== this.chatOrigin) {
+        try { this.chatRoots = await this.readChats(hostOrigin); this.classificationWarning = ''; this.chatOrigin = hostOrigin; }
         catch { this.chatRoots = null; this.classificationWarning = 'Classement Chats indisponible : ces sources restent non classées.'; }
       }
       this.api = await this.connect();
