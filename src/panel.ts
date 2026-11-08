@@ -166,7 +166,14 @@ async function loadIndex() {
     const next: Index = await request('/index?' + params);
     if (epoch !== viewEpoch) return;
     result = next; version = next.version; page = next.page;
-    if (!next.unchanged) { items = next.artifacts ?? []; spaces = next.spaces ?? []; renderChrome(); renderContent(); }
+    // A poll that returns identical rows must not touch the DOM: rebuilding the
+    // grid destroys every preview iframe and flashes the whole page.
+    if (!next.unchanged) {
+      const rendered = content.dataset.ids ?? null;
+      items = next.artifacts ?? []; spaces = next.spaces ?? [];
+      renderChrome();
+      if (rendered !== items.map(row => row.id).join()) renderContent();
+    }
     const s = next.status;
     renderStatus();
     clearTimeout(timer);
@@ -244,7 +251,11 @@ function toggleSelecting(force?: boolean) {
 function toggleSelected(id: string) {
   if (selected.has(id)) selected.delete(id); else selected.add(id);
   const card = content.querySelector<HTMLElement>(`.artifact[data-id="${id}"]`);
-  if (card) { card.classList.toggle('selected', selected.has(id)); card.querySelector('.artifact-pick')?.setAttribute('aria-pressed', String(selected.has(id))); }
+  if (card) {
+    const on = selected.has(id), pick = card.querySelector<HTMLElement>('.artifact-pick');
+    card.classList.toggle('selected', on);
+    if (pick) { pick.setAttribute('aria-pressed', String(on)); pick.textContent = on ? '✓' : ''; pick.classList.add('on'); }
+  }
   renderSelectionBar();
 }
 function selectedItems() { return items.filter(item => selected.has(item.id)); }
@@ -274,10 +285,18 @@ function fileName(item: Item) {
   const ext = /\.[a-z0-9]{1,8}$/i.test(safe) ? '' : '.' + (item.format || 'bin').toLowerCase();
   return safe + ext;
 }
-function saveBlob(blob: Blob, name: string) {
-  const url = URL.createObjectURL(blob); const link = document.createElement('a');
+/**
+ * Hand bytes to the browser as a download. The panel is sandboxed, so this only
+ * reaches the user's disk when the host grants `allow-downloads`; we cannot
+ * observe the result, so the caller must not claim more than "asked the browser".
+ */
+function saveBlob(blob: Blob, name: string): boolean {
+  if (!blob.size) return false;
+  const url = URL.createObjectURL(blob), link = document.createElement('a');
   link.href = url; link.download = name; link.rel = 'noopener'; document.body.append(link); link.click(); link.remove();
-  setTimeout(() => URL.revokeObjectURL(url), 30_000);
+  // Long enough for the browser to start the transfer, short enough to free memory.
+  setTimeout(() => URL.revokeObjectURL(url), 60_000);
+  return true;
 }
 /** Fetch one artifact's bytes exactly as the preview does, without a live view to cancel. */
 async function artifactBytes(item: Item): Promise<Blob | null> {
@@ -315,7 +334,9 @@ async function downloadSelected() {
   try {
     if (picked.length === 1) {
       const blob = await artifactBytes(picked[0]); if (!blob) { report(Error(t('Téléchargement impossible pour cet artefact.'))); return; }
-      saveBlob(blob, fileName(picked[0])); notice.textContent = t('{count} fichier(s) téléchargé(s).', { count: 1 });
+      const name = fileName(picked[0]);
+      if (!saveBlob(blob, name)) { report(Error(t('Cet artefact est vide.'))); return; }
+      notice.textContent = t('Envoi de {name} au navigateur.', { name });
       return;
     }
     const files: { name: string; blob: Blob }[] = [], payloads: Uint8Array[] = [];
@@ -324,16 +345,31 @@ async function downloadSelected() {
       files.push({ name: fileName(item), blob }); payloads.push(new Uint8Array(await blob.arrayBuffer()));
     }
     if (!files.length) { report(Error(t('Téléchargement impossible pour cet artefact.'))); return; }
-    saveBlob(zip(files, payloads), `galerie-${new Date().toISOString().slice(0, 10)}.zip`);
-    notice.textContent = t('{count} fichier(s) téléchargé(s).', { count: files.length });
+    const archive = `galerie-${new Date().toISOString().slice(0, 10)}.zip`;
+    if (!saveBlob(zip(files, payloads), archive)) { report(Error(t('Cet artefact est vide.'))); return; }
+    notice.textContent = t('Envoi de {name} au navigateur ({count} fichiers).', { name: archive, count: files.length });
   } catch (error) { report(error); }
 }
-function confirmDeletion(count: number): boolean {
-  return window.confirm(t('Supprimer {count} artefact(s) ?', { count }) + '\n\n' + t('Les artefacts de conversation sont seulement masqués ; les fichiers du disque sont supprimés pour de bon.'));
+/**
+ * In-panel confirmation. The host sandboxes extension panels without
+ * `allow-modals`, so window.confirm() always returns false here.
+ */
+function confirmAction(message: string, detail: string, action: string): Promise<boolean> {
+  return new Promise(resolve => {
+    const dialog = document.createElement('dialog'); dialog.className = 'confirm-dialog';
+    const body = el('div', 'confirm-body'); body.append(el('h2', '', message), el('p', '', detail));
+    const actions = el('div', 'confirm-actions');
+    let settled = false;
+    const finish = (value: boolean) => { if (settled) return; settled = true; dialog.close(); dialog.remove(); resolve(value); };
+    actions.append(button(t('Annuler'), () => finish(false), 'plain-button'), button(action, () => finish(true), 'confirm-accept'));
+    body.append(actions); dialog.append(body);
+    dialog.addEventListener('cancel', event => { event.preventDefault(); finish(false); });
+    document.body.append(dialog); dialog.showModal();
+  });
 }
 async function deleteSelected() {
   const picked = selectedItems(); if (!picked.length) return;
-  if (!confirmDeletion(picked.length)) return;
+  if (!await confirmAction(t('Supprimer {count} artefact(s) ?', { count: picked.length }), t('Les artefacts de conversation sont seulement masqués ; les fichiers du disque sont supprimés pour de bon.'), t('Confirmer la suppression'))) return;
   try {
     const result = await request('/delete', { ids: picked.map(item => item.id) });
     await persistHidden(result.hiddenList);
@@ -351,7 +387,7 @@ async function attachSelected() {
 }
 /** Persist the hidden list so it survives a service restart (the panel owns storage). */
 async function deleteOne(item: Item) {
-  if (!confirmDeletion(1)) return;
+  if (!await confirmAction(t('Supprimer {count} artefact(s) ?', { count: 1 }), t('Les artefacts de conversation sont seulement masqués ; les fichiers du disque sont supprimés pour de bon.'), t('Confirmer la suppression'))) return;
   try {
     const result = await request('/delete', { ids: [item.id] });
     hiddenIds = new Set(result.hiddenList);
@@ -380,6 +416,8 @@ function dateLabel(date: Date) {
   return date.toDateString() === today.toDateString() ? t('Aujourd’hui') : date.toDateString() === yesterday.toDateString() ? t('Hier') : date.toLocaleDateString(locale, { day: 'numeric', month: 'long', year: 'numeric' });
 }
 function renderContent() {
+  // Remember what is on screen so a poll with identical rows can skip the rebuild.
+  content.dataset.ids = items.map(item => item.id).join();
   clearThumbnails(); content.replaceChildren();
   if (!items.length) {
     const filtered = query || type !== 'all', empty = el('div', 'empty');
@@ -395,11 +433,13 @@ function renderContent() {
     const isHidden = result?.context.showHidden === true && hiddenIds.has(item.id);
     card.classList.toggle('selected', selected.has(item.id)); card.classList.toggle('is-hidden', isHidden);
     thumb.dataset.id = item.id; thumb.dataset.format = item.format; thumb.append(el('span', 'placeholder', item.format)); open.setAttribute('aria-label', t('Ouvrir {title}', { title: item.title })); open.append(thumb, el('span', 'artifact-title', item.title)); open.title = item.title;
-    if (selecting) {
-      const pick = button('', () => toggleSelected(item.id), 'artifact-pick');
-      pick.setAttribute('aria-label', t('Sélectionner {title}', { title: item.title })); pick.setAttribute('aria-pressed', String(selected.has(item.id))); pick.textContent = selected.has(item.id) ? '✓' : '';
-      card.prepend(pick);
-    }
+    // The tick box sits on every card, top left; clicking it never opens the preview.
+    const pick = button('', () => toggleSelected(item.id), 'artifact-pick');
+    pick.setAttribute('aria-label', t('Sélectionner {title}', { title: item.title }));
+    pick.setAttribute('aria-pressed', String(selected.has(item.id)));
+    pick.textContent = selected.has(item.id) ? '✓' : '';
+    pick.classList.toggle('on', selecting || selected.has(item.id));
+    card.prepend(pick);
     if (isHidden) card.append(el('span', 'hidden-badge', t('Élément masqué')));
     const meta = el('div', 'artifact-meta'), time = document.createElement('time'); time.dateTime = date.toISOString(); time.textContent = date.toLocaleTimeString(locale, { hour: '2-digit', minute: '2-digit' }); time.title = date.toLocaleString(locale);
     const session = el('span', '', item.sessionArchived ? t('{title} · archivée', { title: item.sessionTitle }) : item.sessionTitle); session.title = item.sessionArchived ? t('{title} (conversation archivée)', { title: item.sessionTitle }) : item.sessionTitle; meta.append(time, session);
@@ -530,7 +570,15 @@ host.onItem(item => {
   pendingItem = data.artifactId; void openPendingItem();
 });
 window.addEventListener('message', event => { if (activePreview && event.source === activePreview.contentWindow && event.data?.type === 'openchamber:html-render:open-link' && typeof event.data.url === 'string' && /^https?:\/\//.test(event.data.url)) void host.openUrl(event.data.url).catch(report); });
-host.onSession(session => { if (!context) return; const changed = context.session?.id !== session?.id; context = { ...context, session }; if (changed) followContext(); else renderChrome(); });
+host.onSession(session => {
+  if (!context) return;
+  const changed = context.session?.id !== session?.id;
+  const titleChanged = context.session?.title !== session?.title;
+  context = { ...context, session };
+  // Session events fire constantly while a turn streams; only the id and title
+  // change what the gallery draws, so anything else must not repaint the page.
+  if (changed) followContext(); else if (titleChanged) renderChrome();
+});
 host.onDirectory(directory => { if (!context || context.directory === directory) return; context = { ...context, directory }; followContext(); });
 host.onReady(ready => {
   const changed = context && (context.session?.id !== ready.session?.id || context.directory !== ready.directory), themeChanged = context?.theme.mode !== ready.theme.mode; context = ready; applyHostReady(ready, document.documentElement);

@@ -94,6 +94,9 @@ const english: Record<string, string> = {
   'Restaurer': 'Restore', 'Restaurer {count} artefact(s) ?': 'Restore {count} artifact(s)?',
   '{count} restauré(s).': '{count} restored.', 'Élément masqué': 'Hidden item',
   // Download
+  'Envoi de {name} au navigateur.': 'Sending {name} to the browser.',
+  'Envoi de {name} au navigateur ({count} fichiers).': 'Sending {name} to the browser ({count} files).',
+  'Cet artefact est vide.': 'This artifact is empty.',
   'Téléchargement impossible pour cet artefact.': 'Cannot download this artifact.',
   '{count} fichier(s) téléchargé(s).': '{count} file(s) downloaded.', 'Archive ZIP': 'ZIP archive',
   // Go to chat
