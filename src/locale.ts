@@ -95,6 +95,7 @@ const english: Record<string, string> = {
   '{count} restauré(s).': '{count} restored.', 'Élément masqué': 'Hidden item',
   // Download
   'Prêt : clique le lien pour enregistrer le fichier.': 'Ready: click the link to save the file.',
+  'Si rien ne se télécharge, fais un clic droit → « Enregistrer la cible du lien sous… ».': 'If nothing downloads, right-click → "Save Link As…".',
   'Télécharger {name}': 'Download {name}',
   'Archive de {count} fichiers prête : clique le lien pour enregistrer.': 'Archive of {count} files ready: click the link to save.',
   'o': 'B', 'Ko': 'KB', 'Mo': 'MB',

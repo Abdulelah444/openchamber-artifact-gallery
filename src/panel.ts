@@ -349,6 +349,9 @@ async function showDownloadLink(blob: Blob, name: string, label: string) {
   link.target = '_blank';
   link.textContent = t('Télécharger {name}', { name });
   link.title = `${name} · ${formatSize(blob.size)}`;
+  // A right-click "Save link as…" is the one gesture no browser can drop, so
+  // surface it as a hint and keep the link a real anchor the user controls.
+  link.addEventListener('click', () => { notice.textContent = t('Si rien ne se télécharge, fais un clic droit → « Enregistrer la cible du lien sous… ».', { name }); });
   const dismiss = button('✕', () => { downloadBar.hidden = true; downloadBar.replaceChildren(); }, 'plain-button icon-button');
   dismiss.setAttribute('aria-label', t('Fermer'));
   downloadBar.replaceChildren(el('span', 'download-hint', label), link, dismiss);
