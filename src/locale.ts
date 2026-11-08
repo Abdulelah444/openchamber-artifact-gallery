@@ -73,6 +73,31 @@ const english: Record<string, string> = {
   'Fichier trop volumineux pour cet aperçu.': 'File too large for this preview.', 'Fichier source introuvable.': 'Source file not found.',
   'Lecture du fichier source refusée.': 'Source file read denied.', 'Aperçu expiré : ouvre-le à nouveau.': 'Preview expired: reopen it.', 'Position invalide.': 'Invalid position.',
   'Pièce jointe': 'Attachment', 'Capture navigateur': 'Browser capture', 'Fichier présenté': 'Presented file', 'Lien du message': 'Message link',
+  // Sorting
+  'Trier': 'Sort', 'Trier les artefacts': 'Sort artifacts', 'Plus récents': 'Newest first', 'Plus anciens': 'Oldest first',
+  'Nom (A–Z)': 'Name (A–Z)', 'Nom (Z–A)': 'Name (Z–A)', 'Taille (gros d’abord)': 'Size (largest first)', 'Par type': 'By type', 'Taille': 'Size',
+  // Selection
+  'Sélectionner': 'Select', 'Sélectionner {title}': 'Select {title}', 'Sélectionner tous les artefacts de la page': 'Select all artifacts on this page',
+  'Annuler la sélection': 'Clear selection', '{count} sélectionné(s)': '{count} selected', 'Tout sélectionner': 'Select all',
+  'Télécharger': 'Download', 'Supprimer': 'Delete', 'Ajouter au message': 'Add to message',
+  // Delete
+  'Supprimer {count} artefact(s) ?': 'Delete {count} artifact(s)?',
+  'Cette action est définitive pour les fichiers trouvés sur le disque.': 'This is permanent for files found on disk.',
+  'Les artefacts de conversation sont seulement masqués ; les fichiers du disque sont supprimés pour de bon.': 'Conversation artifacts are only hidden; files on disk are deleted for good.',
+  'Confirmer la suppression': 'Confirm delete', 'Suppression annulée.': 'Delete cancelled.',
+  '{hidden} masqué(s), {deleted} fichier(s) supprimé(s).': '{hidden} hidden, {deleted} file(s) deleted.',
+  '{count} suppression(s) impossible(s) : {detail}': '{count} could not be deleted: {detail}',
+  'Fichier hors des racines explorées ; suppression refusée.': 'File outside the explored roots; deletion refused.',
+  'Suppression refusée par le système.': 'Deletion refused by the system.', 'Fichier déjà absent.': 'File already gone.',
+  'Masqués': 'Hidden', 'Afficher les masqués': 'Show hidden', 'Masquer les masqués': 'Hide hidden items',
+  'Afficher les éléments masqués au lieu de les cacher.': 'Show hidden items instead of hiding them.',
+  'Restaurer': 'Restore', 'Restaurer {count} artefact(s) ?': 'Restore {count} artifact(s)?',
+  '{count} restauré(s).': '{count} restored.', 'Élément masqué': 'Hidden item',
+  // Download
+  'Téléchargement impossible pour cet artefact.': 'Cannot download this artifact.',
+  '{count} fichier(s) téléchargé(s).': '{count} file(s) downloaded.', 'Archive ZIP': 'ZIP archive',
+  // Go to chat
+  'Go to chat': 'Go to chat', 'Go to the archived chat': 'Go to the archived chat',
 };
 export function t(message: string, values: Record<string, string | number> = {}) {
   const text = locale === 'fr' ? message : english[message] ?? message.replace(/^Lecture OpenCode refusée \((\d+)\)\.$/, 'OpenCode read denied ($1).');

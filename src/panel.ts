@@ -19,6 +19,12 @@ const kinds: Record<string, string> = { page: 'Pages inline', image: 'Images', d
 let context: HostReadyContext, initialized = false, mounted = false;
 let items: Item[] = [], spaces: NonNullable<Index['spaces']> = [], result: Index | null = null;
 let scope: 'session' | 'space' | 'all' = 'session', project = 'all', type = 'all', query = '', page = 1;
+let sort: 'recent' | 'oldest' | 'name' | 'name-desc' | 'size' | 'type' = 'recent', showHidden = false;
+// Multi-select: ids of the cards picked for download / delete / attach.
+const selected = new Set<string>();
+let selecting = false;
+/** Mirrors the service's hidden list so hidden cards can be marked and restored. */
+let hiddenIds = new Set<string>();
 let settings: Preferences = { previews: 'visible', density: 'comfortable', pageSize: 12, automatic: true, projectIcons: true, language: 'auto' };
 const projectIcons = new ProjectIcons(request);
 let iconProjects = new Set<string>();
@@ -57,7 +63,15 @@ const dialog = document.createElement('dialog'); dialog.className = 'preview-dia
 const projectMenu = el('div', 'project-menu'); projectMenu.setAttribute('popover', 'auto');
 const exploreButton = button('Explorer', () => projectMenu.showPopover(), 'plain-button explore-button');
 projectMenu.addEventListener('toggle', () => renderSpaces(projectMenu));
-let search: ReturnType<typeof mountSearchField>, typePicker: ReturnType<typeof mountSelect>, settingsButton: ReturnType<typeof mountButton>, refreshButton: ReturnType<typeof mountButton>;
+let search: ReturnType<typeof mountSearchField>, typePicker: ReturnType<typeof mountSelect>, sortPicker: ReturnType<typeof mountSelect>, settingsButton: ReturnType<typeof mountButton>, refreshButton: ReturnType<typeof mountButton>;
+const selectionBar = el('div', 'selection-bar');
+const selectButton = button('Sélectionner', () => toggleSelecting(), 'plain-button select-button');
+const hiddenButton = button('Afficher les masqués', () => { showHidden = !showHidden; page = 1; changeView(); }, 'plain-button hidden-toggle');
+const sortOptions = [
+  { id: 'recent', label: 'Plus récents' }, { id: 'oldest', label: 'Plus anciens' },
+  { id: 'name', label: 'Nom (A–Z)' }, { id: 'name-desc', label: 'Nom (Z–A)' },
+  { id: 'size', label: 'Taille (gros d’abord)' }, { id: 'type', label: 'Par type' },
+] as const;
 
 // Bound source reads across thumbnails and the expanded preview, including resource chunks.
 let reads = 0; const waiters: (() => void)[] = [];
@@ -77,9 +91,9 @@ dialog.addEventListener('close', () => { modalVersion++; activePreview = null; d
 dialog.addEventListener('click', event => { if (event.target === dialog) { const r = dialog.getBoundingClientRect(); if (event.clientX < r.left || event.clientX > r.right || event.clientY < r.top || event.clientY > r.bottom) closeDialog(); } });
 
 function filters() {
-  return new URLSearchParams({ scope, project, type, q: query, page: String(page), size: String(settings.pageSize), ...(context.session ? { session: context.session.id } : {}), ...(context.directory ? { directory: context.directory } : {}) });
+  return new URLSearchParams({ scope, project, type, sort, q: query, page: String(page), size: String(settings.pageSize), ...(showHidden ? { hidden: '1' } : {}), ...(context.session ? { session: context.session.id } : {}), ...(context.directory ? { directory: context.directory } : {}) });
 }
-function resetFilters() { query = ''; type = 'all'; page = 1; search.update({ value: '' }); typePicker.update({ value: 'all' }); clearTimeout(searchTimer); }
+function resetFilters() { query = ''; type = 'all'; page = 1; selected.clear(); selecting = false; search.update({ value: '' }); typePicker.update({ value: 'all' }); clearTimeout(searchTimer); }
 function changeView() {
   viewEpoch++; version = ''; clearThumbnails(); content.replaceChildren(el('p', 'source-note', t('Chargement des références…')));
   renderChrome(); void loadIndex();
@@ -106,7 +120,16 @@ function renderChrome() {
   exploreButton.textContent = t('Explorer'); settingsButton.update({ label: t('Réglages') }); refreshButton.update({ label: t('Actualiser') });
   actions.querySelector('.oc-sdk-btn')?.setAttribute('aria-label', t('Réglages de la galerie'));
   typePicker.update({ options: [{ id: 'all', label: t('Tous les types') }, ...Object.entries(kinds).map(([id, label]) => ({ id, label: t(label) }))] });
-  controls.querySelector('.picker button')?.setAttribute('aria-label', t('Filtrer par type'));
+  controls.querySelector('.picker:not(.sort-picker) button')?.setAttribute('aria-label', t('Filtrer par type'));
+  sortPicker.update({ options: sortOptions.map(option => ({ id: option.id, label: t(option.label) })) });
+  controls.querySelector('.sort-picker button')?.setAttribute('aria-label', t('Trier les artefacts'));
+  selectButton.textContent = selecting ? t('Annuler la sélection') : t('Sélectionner');
+  selectButton.setAttribute('aria-pressed', String(selecting));
+  // The hidden toggle only appears when something is actually hidden or already being shown.
+  const hidden = result?.context.hidden ?? 0;
+  hiddenButton.hidden = !hidden && !showHidden;
+  hiddenButton.textContent = showHidden ? t('Masquer les masqués') : t('Afficher les masqués') + (hidden ? ` (${hidden})` : '');
+  hiddenButton.setAttribute('aria-pressed', String(showHidden));
   app.dataset.surface = context.surface; app.dataset.density = settings.density;
   const activeSpace = result?.context.space, middle = activeSpace?.kind === 'chats' ? 'Chats' : 'Projet';
   scopes.replaceChildren();
@@ -123,15 +146,17 @@ function renderChrome() {
   renderStatus();
 }
 function mount() {
-  header.append(el('h1', '', 'Galerie'), actions); actions.append(exploreButton);
+  header.append(el('h1', '', 'Galerie'), actions); actions.append(exploreButton, hiddenButton, selectButton);
   settingsButton = mountButton(actions, { label: t('Réglages'), variant: 'ghost', size: 'sm', onClick: openSettings });
   actions.lastElementChild?.setAttribute('aria-label', 'Réglages de la galerie');
   refreshButton = mountButton(actions, { label: t('Actualiser'), variant: 'ghost', size: 'sm', onClick: () => void refresh(true) });
-  const searchSlot = el('div', 'search'), typeSlot = el('div', 'picker'); controls.append(searchSlot, typeSlot);
+  const searchSlot = el('div', 'search'), typeSlot = el('div', 'picker'), sortSlot = el('div', 'picker sort-picker'); controls.append(searchSlot, typeSlot, sortSlot);
   search = mountSearchField(searchSlot, { value: '', label: 'Rechercher les artefacts', placeholder: 'Rechercher', onChange(value) { query = value.slice(0, 1000); search.update({ value: query }); page = 1; clearTimeout(searchTimer); searchTimer = setTimeout(changeView, 180); } });
   typePicker = mountSelect(typeSlot, { value: type, options: [{ id: 'all', label: 'Tous les types' }, ...Object.entries(kinds).map(([id, label]) => ({ id, label }))], onChange(value) { type = value; page = 1; typePicker.update({ value }); changeView(); } });
   typeSlot.querySelector('button')?.setAttribute('aria-label', 'Filtrer par type');
-  work.append(controls, notice, errorLine, content); layout.append(explorer, work);
+  sortPicker = mountSelect(sortSlot, { value: sort, options: sortOptions.map(option => ({ ...option })), onChange(value) { sort = value as typeof sort; sortPicker.update({ value }); selected.clear(); changeView(); } });
+  sortSlot.querySelector('button')?.setAttribute('aria-label', 'Trier les artefacts');
+  work.append(controls, selectionBar, notice, errorLine, content); layout.append(explorer, work);
   app.replaceChildren(header, scopes, scopeContext, layout, destination, projectMenu, dialog); mounted = true; renderChrome();
 }
 async function loadIndex() {
@@ -209,6 +234,147 @@ async function drain() {
   catch { if (root.isConnected && active.has(root) && root.dataset.epoch === epoch) root.replaceChildren(el('span', 'unavailable', t('Aperçu indisponible'))); }
   finally { loading--; void drain(); }
 }
+// ---- Selection, download, delete -------------------------------------------------
+
+function toggleSelecting(force?: boolean) {
+  selecting = force ?? !selecting;
+  if (!selecting) selected.clear();
+  renderChrome(); renderContent();
+}
+function toggleSelected(id: string) {
+  if (selected.has(id)) selected.delete(id); else selected.add(id);
+  const card = content.querySelector<HTMLElement>(`.artifact[data-id="${id}"]`);
+  if (card) { card.classList.toggle('selected', selected.has(id)); card.querySelector('.artifact-pick')?.setAttribute('aria-pressed', String(selected.has(id))); }
+  renderSelectionBar();
+}
+function selectedItems() { return items.filter(item => selected.has(item.id)); }
+function renderSelectionBar() {
+  selectionBar.replaceChildren();
+  if (!selecting && !selected.size) { selectionBar.hidden = true; return; }
+  selectionBar.hidden = false;
+  const count = selectedItems().length, all = items.length > 0 && count === items.length;
+  selectionBar.append(el('span', 'selection-count', t('{count} sélectionné(s)', { count })));
+  const allButton = button(t(all ? 'Annuler la sélection' : 'Tout sélectionner'), () => {
+    if (all) selected.clear(); else for (const item of items) selected.add(item.id);
+    renderChrome(); renderContent();
+  }, 'plain-button');
+  const download = button(t('Télécharger'), () => void downloadSelected(), 'action-button');
+  download.disabled = !count;
+  const remove = button(t('Supprimer'), () => void deleteSelected(), 'action-button danger');
+  remove.disabled = !count;
+  const attachAll = button(t('Ajouter au message'), () => void attachSelected(), 'action-button');
+  attachAll.disabled = !count || !context.session;
+  const close = button('✕', () => toggleSelecting(false), 'plain-button icon-button');
+  close.setAttribute('aria-label', t('Annuler la sélection'));
+  selectionBar.append(allButton, download, remove, attachAll, close);
+}
+function fileName(item: Item) {
+  const base = (item.path ? item.path.split(/[\\/]/).pop() : item.title) || item.title;
+  const safe = base.replace(/[\\/:*?"<>|]+/g, '-').replace(/\s+/g, ' ').trim().slice(0, 120) || 'artifact';
+  const ext = /\.[a-z0-9]{1,8}$/i.test(safe) ? '' : '.' + (item.format || 'bin').toLowerCase();
+  return safe + ext;
+}
+function saveBlob(blob: Blob, name: string) {
+  const url = URL.createObjectURL(blob); const link = document.createElement('a');
+  link.href = url; link.download = name; link.rel = 'noopener'; document.body.append(link); link.click(); link.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 30_000);
+}
+/** Fetch one artifact's bytes exactly as the preview does, without a live view to cancel. */
+async function artifactBytes(item: Item): Promise<Blob | null> {
+  try {
+    const preview = await request('/preview?id=' + item.id);
+    if (preview.kind === 'page') {
+      let html: string = preview.html;
+      for (const image of preview.images) html = html.split(image.source).join(await dataUrl(await bytes(image, () => true)));
+      return new Blob([html], { type: 'text/html' });
+    }
+    return await bytes(preview.resource, () => true);
+  } catch { return null; }
+}
+// One dependency-free ZIP (store only): a multi-file selection is a single browser download.
+function zip(files: { name: string; blob: Blob }[], payloads: Uint8Array[]): Blob {
+  const encoder = new TextEncoder(), entries: Uint8Array[] = [], central: Uint8Array[] = [];
+  const crcTable = (() => { const table = new Uint32Array(256); for (let n = 0; n < 256; n++) { let c = n; for (let k = 0; k < 8; k++) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1; table[n] = c >>> 0; } return table; })();
+  const crc32 = (data: Uint8Array) => { let c = 0xffffffff; for (const byte of data) c = crcTable[(c ^ byte) & 0xff] ^ (c >>> 8); return (c ^ 0xffffffff) >>> 0; };
+  const u16 = (v: number) => [v & 0xff, (v >>> 8) & 0xff], u32 = (v: number) => [v & 0xff, (v >>> 8) & 0xff, (v >>> 16) & 0xff, (v >>> 24) & 0xff];
+  let offset = 0;
+  const used = new Set<string>();
+  files.forEach((file, index) => {
+    let name = file.name; for (let n = 2; used.has(name); n++) name = file.name.replace(/(\.[^.]+)?$/, `-${n}$1`); used.add(name);
+    const nameBytes = encoder.encode(name), data = payloads[index], crc = crc32(data), time = 0, date = 0x21;
+    const local = new Uint8Array([0x50, 0x4b, 0x03, 0x04, ...u16(20), ...u16(0), ...u16(0), ...u16(time), ...u16(date), ...u32(crc), ...u32(data.length), ...u32(data.length), ...u16(nameBytes.length), ...u16(0)]);
+    entries.push(local, nameBytes, data);
+    central.push(new Uint8Array([0x50, 0x4b, 0x01, 0x02, ...u16(20), ...u16(20), ...u16(0), ...u16(0), ...u16(time), ...u16(date), ...u32(crc), ...u32(data.length), ...u32(data.length), ...u16(nameBytes.length), ...u16(0), ...u16(0), ...u16(0), ...u16(0), ...u32(0), ...u32(offset), ...nameBytes]));
+    offset += local.length + nameBytes.length + data.length;
+  });
+  const directory = new Blob(central), end = new Uint8Array([0x50, 0x4b, 0x05, 0x06, ...u16(0), ...u16(0), ...u16(files.length), ...u16(files.length), ...u32(directory.size), ...u32(offset), ...u16(0)]);
+  return new Blob([...entries, directory, end], { type: 'application/zip' });
+}
+async function downloadSelected() {
+  const picked = selectedItems(); if (!picked.length) return;
+  try {
+    if (picked.length === 1) {
+      const blob = await artifactBytes(picked[0]); if (!blob) { report(Error(t('Téléchargement impossible pour cet artefact.'))); return; }
+      saveBlob(blob, fileName(picked[0])); notice.textContent = t('{count} fichier(s) téléchargé(s).', { count: 1 });
+      return;
+    }
+    const files: { name: string; blob: Blob }[] = [], payloads: Uint8Array[] = [];
+    for (const item of picked) {
+      const blob = await artifactBytes(item); if (!blob) continue;
+      files.push({ name: fileName(item), blob }); payloads.push(new Uint8Array(await blob.arrayBuffer()));
+    }
+    if (!files.length) { report(Error(t('Téléchargement impossible pour cet artefact.'))); return; }
+    saveBlob(zip(files, payloads), `galerie-${new Date().toISOString().slice(0, 10)}.zip`);
+    notice.textContent = t('{count} fichier(s) téléchargé(s).', { count: files.length });
+  } catch (error) { report(error); }
+}
+function confirmDeletion(count: number): boolean {
+  return window.confirm(t('Supprimer {count} artefact(s) ?', { count }) + '\n\n' + t('Les artefacts de conversation sont seulement masqués ; les fichiers du disque sont supprimés pour de bon.'));
+}
+async function deleteSelected() {
+  const picked = selectedItems(); if (!picked.length) return;
+  if (!confirmDeletion(picked.length)) return;
+  try {
+    const result = await request('/delete', { ids: picked.map(item => item.id) });
+    await persistHidden(result.hiddenList);
+    selected.clear(); hiddenIds = new Set(result.hiddenList);
+    if (result.hidden.length || result.deleted.length) notice.textContent = t('{hidden} masqué(s), {deleted} fichier(s) supprimé(s).', { hidden: result.hidden.length, deleted: result.deleted.length });
+    if (result.failed?.length) errorLine.textContent = t('{count} suppression(s) impossible(s) : {detail}', { count: result.failed.length, detail: result.failed.map((f: any) => t(f.error)).join(' · ') });
+    changeView();
+  } catch (error) { report(error); }
+}
+async function attachSelected() {
+  const picked = selectedItems(); if (!picked.length || !context.session) return;
+  for (const item of picked) { try { await attachOnly(item); } catch (error) { report(error); return; } }
+  selected.clear(); renderSelectionBar(); renderContent();
+  notice.textContent = t('{count} sélectionné(s)', { count: picked.length });
+}
+/** Persist the hidden list so it survives a service restart (the panel owns storage). */
+async function deleteOne(item: Item) {
+  if (!confirmDeletion(1)) return;
+  try {
+    const result = await request('/delete', { ids: [item.id] });
+    hiddenIds = new Set(result.hiddenList);
+    await persistHidden(result.hiddenList);
+    if (dialog.open && detail?.id === item.id) closeDialog();
+    if (result.failed?.length) errorLine.textContent = t('{count} suppression(s) impossible(s) : {detail}', { count: result.failed.length, detail: result.failed.map((f: any) => t(f.error)).join(' · ') });
+    changeView();
+  } catch (error) { report(error); }
+}
+async function restoreOne(item: Item) {
+  hiddenIds.delete(item.id);
+  try { await request('/hidden', { ids: [...hiddenIds] }); await persistHidden([...hiddenIds]); changeView(); } catch (error) { report(error); }
+}
+async function persistHidden(ids: string[]) {
+  try { await host.storage.set('hidden-artifacts', ids as unknown as never); } catch { /* the service keeps them in memory */ }
+}
+async function loadHidden() {
+  try {
+    const saved = await host.storage.get('hidden-artifacts');
+    if (Array.isArray(saved) && saved.length) await request('/hidden', { ids: saved.filter(id => typeof id === 'string') });
+  } catch { /* an empty hidden list is a normal start */ }
+}
+
 function dateLabel(date: Date) {
   const today = new Date(), yesterday = new Date(); yesterday.setDate(today.getDate() - 1);
   return date.toDateString() === today.toDateString() ? t('Aujourd’hui') : date.toDateString() === yesterday.toDateString() ? t('Hier') : date.toLocaleDateString(locale, { day: 'numeric', month: 'long', year: 'numeric' });
@@ -218,7 +384,7 @@ function renderContent() {
   if (!items.length) {
     const filtered = query || type !== 'all', empty = el('div', 'empty');
     empty.append(el('h2', '', t(filtered ? 'Aucun artefact ne correspond' : scope === 'session' ? 'Cette session n’a pas encore d’artefact' : 'Pas encore d’artefact ici')), el('p', '', t(filtered ? 'Essaie un autre type ou mot-clé.' : 'Élargis la portée pour retrouver un autre livrable.')));
-    mountButton(empty, { label: t(filtered ? 'Effacer les filtres' : scope === 'session' ? result?.context.space.kind === 'chats' ? 'Voir Chats' : 'Voir le projet' : 'Voir tout'), size: 'sm', variant: 'outline', onClick: () => { if (filtered) { resetFilters(); changeView(); } else setScope(scope === 'session' ? 'space' : 'all'); } }); content.append(empty); return;
+    mountButton(empty, { label: t(filtered ? 'Effacer les filtres' : scope === 'session' ? result?.context.space.kind === 'chats' ? 'Voir Chats' : 'Voir le projet' : 'Voir tout'), size: 'sm', variant: 'outline', onClick: () => { if (filtered) { resetFilters(); changeView(); } else setScope(scope === 'session' ? 'space' : 'all'); } }); content.append(empty); renderSelectionBar(); return;
   }
   let day = '', grid: HTMLElement;
   for (const item of items) {
@@ -226,7 +392,15 @@ function renderContent() {
     if (label !== day) { day = label; const group = el('section', 'day-section'), head = el('header', 'day-heading'); head.append(el('h2', '', label), el('span', '', date.toLocaleDateString(locale))); grid = el('div', 'grid'); group.append(head, grid); content.append(group); }
     const card = el('article', 'artifact'), open = button('', () => void openDetail(item), 'artifact-open'), thumb = el('div', 'thumbnail');
     card.dataset.id = item.id;
+    const isHidden = result?.context.showHidden === true && hiddenIds.has(item.id);
+    card.classList.toggle('selected', selected.has(item.id)); card.classList.toggle('is-hidden', isHidden);
     thumb.dataset.id = item.id; thumb.dataset.format = item.format; thumb.append(el('span', 'placeholder', item.format)); open.setAttribute('aria-label', t('Ouvrir {title}', { title: item.title })); open.append(thumb, el('span', 'artifact-title', item.title)); open.title = item.title;
+    if (selecting) {
+      const pick = button('', () => toggleSelected(item.id), 'artifact-pick');
+      pick.setAttribute('aria-label', t('Sélectionner {title}', { title: item.title })); pick.setAttribute('aria-pressed', String(selected.has(item.id))); pick.textContent = selected.has(item.id) ? '✓' : '';
+      card.prepend(pick);
+    }
+    if (isHidden) card.append(el('span', 'hidden-badge', t('Élément masqué')));
     const meta = el('div', 'artifact-meta'), time = document.createElement('time'); time.dateTime = date.toISOString(); time.textContent = date.toLocaleTimeString(locale, { hour: '2-digit', minute: '2-digit' }); time.title = date.toLocaleString(locale);
     const session = el('span', '', item.sessionArchived ? t('{title} · archivée', { title: item.sessionTitle }) : item.sessionTitle); session.title = item.sessionArchived ? t('{title} (conversation archivée)', { title: item.sessionTitle }) : item.sessionTitle; meta.append(time, session);
     const foot = el('div', 'artifact-foot'), source = button(spaceName(item), () => setProject(item.projectId), 'artifact-project');
@@ -234,8 +408,17 @@ function renderContent() {
     const add = button('+', () => void attach(item), 'quick-attach');
     add.setAttribute('aria-label', t('Ajouter {title} au message', { title: item.title })); add.title = t('Ajouter au brouillon actif'); add.disabled = !context.session;
     foot.append(source);
-    if (!item.discovered) { const chat = button('💬', () => void host.openSession(item.sessionId).catch(report), 'quick-attach'); chat.setAttribute('aria-label', t(item.sessionArchived ? 'Ouvrir la conversation archivée' : 'Ouvrir la conversation')); chat.title = chat.getAttribute('aria-label')!; foot.append(chat); }
-    foot.append(add); card.append(open, meta, foot); grid!.append(card);
+    const tools = el('span', 'artifact-tools');
+    if (!item.discovered) {
+      const chat = button('💬', () => void host.openSession(item.sessionId).catch(report), 'quick-attach');
+      chat.setAttribute('aria-label', t(item.sessionArchived ? 'Go to the archived chat' : 'Go to chat')); chat.title = chat.getAttribute('aria-label')!; tools.append(chat);
+    }
+    const download = button('⤓', () => { selected.clear(); selected.add(item.id); void downloadSelected().finally(() => selected.clear()); }, 'quick-attach');
+    download.setAttribute('aria-label', t('Télécharger')); download.title = t('Télécharger'); tools.append(download);
+    const trash = button(isHidden ? '↺' : '🗑', () => void (isHidden ? restoreOne(item) : deleteOne(item)), 'quick-attach');
+    trash.setAttribute('aria-label', t(isHidden ? 'Restaurer' : 'Supprimer')); trash.title = trash.getAttribute('aria-label')!; tools.append(trash);
+    tools.append(add); foot.append(tools);
+    card.append(open, meta, foot); grid!.append(card);
     if (settings.previews === 'visible' && (item.kind === 'page' || item.kind === 'image')) observer.observe(thumb);
   }
   const pagination = el('div', 'pagination');
@@ -244,6 +427,7 @@ function renderContent() {
     if (delta < 0) pagination.append(el('span', '', t('Page {page} / {pages} · {count} cartes', { page, pages: result?.pages ?? 1, count: items.length })));
   }
   content.append(pagination);
+  renderSelectionBar();
   if (pendingFocus) { const label = pendingFocus; pendingFocus = ''; [...pagination.querySelectorAll('button')].find(node => node.textContent === label)?.focus({ preventScroll: true }); }
 }
 async function bytes(resource: { key: string; mime: string; size: number }, current: () => boolean) {
@@ -292,8 +476,10 @@ async function openDetail(item: Item) {
   for (const [label, value] of [['Espace', spaceName(item)], ['Dépôt', item.repo ?? item.directory ?? t('Inconnu')], ['Session', item.sessionArchived ? t('{title} (archivée)', { title: item.sessionTitle }) : item.sessionTitle], ['Création', new Date(item.createdAt).toLocaleString(locale)], ['Type', item.format], ['Origine', t(item.origin)], ['Source', item.path ?? (item.discovered ? t('Fichier du projet') : `Message ${item.messageId}`)]]) list.append(el('dt', '', t(label)), el('dd', '', value));
   details.append(list); mountButton(details, { label: t('Ajouter au message'), size: 'sm', disabled: !context.session, onClick: () => void attach(item) });
   // Open the backing chat when one exists, archived or active; filesystem-only files have none.
-  if (!item.discovered) mountButton(details, { label: t(item.sessionArchived ? 'Ouvrir la conversation archivée' : 'Ouvrir la conversation'), variant: 'outline', size: 'sm', onClick: async () => { try { await host.openSession(item.sessionId); closeDialog(); } catch (error) { report(error); } } });
+  if (!item.discovered) mountButton(details, { label: t(item.sessionArchived ? 'Go to the archived chat' : 'Go to chat'), variant: 'outline', size: 'sm', onClick: async () => { try { await host.openSession(item.sessionId); closeDialog(); } catch (error) { report(error); } } });
   else details.append(el('p', 'source-note', t('Fichier trouvé dans le projet, sans conversation associée.')));
+  mountButton(details, { label: t('Télécharger'), variant: 'outline', size: 'sm', onClick: () => { selected.clear(); selected.add(item.id); void downloadSelected().finally(() => selected.clear()); } });
+  mountButton(details, { label: t('Supprimer'), variant: 'outline', size: 'sm', onClick: async () => { await deleteOne(item); } });
   details.append(el('p', 'source-note', context.session ? t('Destination : {title}. Seule la référence sera ajoutée.', { title: context.session.title }) : t('Ouvre une conversation pour y ajouter cette référence.')), el('p', 'source-note', t('Aperçu depuis la source. Les anciennes demandes de réponse restent désactivées.')));
   preview.append(el('p', 'source-note', t('Chargement…'))); body.append(preview, details); dialog.append(body); showDialog();
   try { await display(preview, item, true); } catch (error) { if (preview.isConnected) preview.replaceChildren(el('p', 'unavailable', t(error instanceof Error ? error.message : 'Source indisponible.'))); }
@@ -301,11 +487,15 @@ async function openDetail(item: Item) {
 function spaceName(item: Item) { return item.spaceKind === 'unknown' ? t('Sources non classées') : item.projectName; }
 function sourceUrl(item: Item) { const url = new URL('/', location.href); url.searchParams.set('session', item.sessionId); url.searchParams.set('message', item.messageId); return url.href; }
 function referenceText(item: Item) { return t('Artefact : {title}\nEspace : {space}\nSession : {session} ({id})\nMessage : {message}\nSource : {source}\n{url}\nRéférence uniquement ; lire le fichier ou le message source si son contenu est demandé.', { title: item.title, space: spaceName(item), session: item.sessionTitle, id: item.sessionId, message: item.messageId, source: item.path ?? t(item.origin), url: sourceUrl(item) }); }
+function reference(item: Item): AttachIssueRequest {
+  return { providerId: 'artifact-gallery', id: 'A-' + item.id.slice(0, 16), title: item.title, url: sourceUrl(item), text: referenceText(item), data: { artifactId: item.id, sessionId: item.sessionId, messageId: item.messageId } };
+}
+/** Attach without the dialog dance: a bulk selection stays on the gallery. */
+async function attachOnly(item: Item) { if (context.session) await host.attach(reference(item)); }
 async function attach(item: Item) {
   if (!context.session) return;
   const target = context.session.id;
-  const reference: AttachIssueRequest = { providerId: 'artifact-gallery', id: 'A-' + item.id.slice(0, 16), title: item.title, url: sourceUrl(item), text: referenceText(item), data: { artifactId: item.id, sessionId: item.sessionId, messageId: item.messageId } };
-  try { await host.attach(reference); closeDialog(); if (context.session?.id === target && context.surface === 'page') await host.close(); }
+  try { await host.attach(reference(item)); closeDialog(); if (context.session?.id === target && context.surface === 'page') await host.close(); }
   catch (error) { report(error); }
 }
 function openSettings() {
@@ -371,6 +561,7 @@ host.onReady(ready => {
     }
     catch { cacheFailed(); }
     cacheReady = true;
+    await loadHidden();
     await refresh(true); void persistWhenSettled(); await openPendingItem(); if (storageError) report(Error('Préférences indisponibles ; réglages par défaut utilisés.'));
   })();
 });

@@ -64,6 +64,24 @@ const server = http.createServer(async (req, res) => {
       return reply(res, 200, { ok: true });
     }
     if (req.method === 'GET' && url.pathname === '/item' && /^[a-f0-9]{64}$/.test(url.searchParams.get('id') ?? '')) return reply(res, 200, library.item(url.searchParams.get('id')!));
+    if (req.method === 'GET' && url.pathname === '/hidden') return reply(res, 200, { ids: library.hiddenList() });
+    if (req.method === 'POST' && url.pathname === '/hidden') {
+      const chunks = []; let size = 0;
+      for await (const chunk of req.iterator({ destroyOnReturn: false })) { size += chunk.length; if (size > 256_000) throw new GalleryError(413, 'Requête trop volumineuse.'); chunks.push(chunk); }
+      let body;
+      try { body = JSON.parse(Buffer.concat(chunks).toString()); } catch { throw new GalleryError(400, 'Requête invalide.'); }
+      if (!body || !Array.isArray(body.ids) || body.ids.length > 20_000 || body.ids.some((id: unknown) => typeof id !== 'string' || !/^[a-f0-9]{64}$/.test(id))) throw new GalleryError(400, 'Requête invalide.');
+      library.setHidden(body.ids);
+      return reply(res, 200, { ok: true, count: library.hidden.size });
+    }
+    if (req.method === 'POST' && url.pathname === '/delete') {
+      const chunks = []; let size = 0;
+      for await (const chunk of req.iterator({ destroyOnReturn: false })) { size += chunk.length; if (size > 64_000) throw new GalleryError(413, 'Requête trop volumineuse.'); chunks.push(chunk); }
+      let body;
+      try { body = JSON.parse(Buffer.concat(chunks).toString()); } catch { throw new GalleryError(400, 'Requête invalide.'); }
+      if (!body || !Array.isArray(body.ids) || !body.ids.length || body.ids.length > 500 || body.ids.some((id: unknown) => typeof id !== 'string' || !/^[a-f0-9]{64}$/.test(id))) throw new GalleryError(400, 'Requête invalide.');
+      return reply(res, 200, await library.remove(body.ids));
+    }
     if (req.method === 'POST' && url.pathname === '/sync') {
       const chunks = []; let size = 0;
       for await (const chunk of req.iterator({ destroyOnReturn: false })) { size += chunk.length; if (size > 64_000) throw new GalleryError(413, 'Requête trop volumineuse.'); chunks.push(chunk); }

@@ -94,6 +94,59 @@ test('index is metadata-only, refresh preserves failures, preview reads the curr
   } finally { await rm(dir, { recursive: true, force: true }); }
 });
 
+test('rows sort by recency, name, size and type, and reject an unknown sort', async () => {
+  const infos = [
+    { id: 'ses_a', title: 'A', location: { directory: '/p' }, time: { updated: 1 } },
+    { id: 'ses_b', title: 'B', location: { directory: '/p' }, time: { updated: 1 } },
+  ];
+  const api = async (path: string) => path === '/api/project' ? [] : path.startsWith('/api/session?') ? { data: infos, cursor: {} }
+    : path.includes('ses_a') && path.includes('/message?') ? { data: [{ ...message([{ type: 'text', text: '[Zulu](z.md)' }]), time: { created: 300 } }], cursor: {} }
+    : path.includes('ses_b') && path.includes('/message?') ? { data: [{ ...message([{ type: 'text', text: '[Alpha](a.md)' }]), time: { created: 100 } }], cursor: {} } : {};
+  const library = new Library(async () => api);
+  await library.sync([]); await library.settled();
+  const titles = (sort: string) => library.index(new URLSearchParams({ scope: 'all', project: 'all', size: '12', sort })).artifacts?.map(row => row.title);
+  expect(titles('recent')).toEqual(['Zulu', 'Alpha']);
+  expect(titles('oldest')).toEqual(['Alpha', 'Zulu']);
+  expect(titles('name')).toEqual(['Alpha', 'Zulu']);
+  expect(titles('name-desc')).toEqual(['Zulu', 'Alpha']);
+  expect(titles('type')).toEqual(['Alpha', 'Zulu']);
+  // Neither message artifact has a measured size, so the size sort falls back to name.
+  expect(titles('size')).toEqual(['Alpha', 'Zulu']);
+  expect(() => library.index(new URLSearchParams({ scope: 'all', size: '12', sort: 'bogus' }))).toThrow('Filtres');
+});
+
+test('delete hides message artifacts but erases discovered files, only inside crawled roots', async () => {
+  // The crawler refuses /tmp and the extension's own tree, so use a neutral scratch root.
+  const dir = await mkdtemp(join('/var/tmp', 'gallery-delete-'));
+  try {
+    const inside = join(dir, 'found.md'), outside = join(tmpdir(), 'gallery-outside.md');
+    await writeFile(inside, 'inside'); await writeFile(outside, 'outside');
+    const api = async (path: string) => path === '/api/project' ? [{ id: 'p', canonical: dir }] : path.startsWith('/api/session?') ? { data: [], cursor: {} } : {};
+    const library = new Library(async () => api);
+    let chatHidden = false;
+    // The crawl only walks registered roots, so /tmp itself is never scanned.
+    await library.sync([{ id: 'p', name: 'P', directory: dir }]); await library.settled();
+    // Added after sync: a re-scan replaces session buckets with what the store reports.
+    library.sessions.set('ses_1', { id: 'ses_1', title: 'T', directory: dir, projectId: 'p', updated: 1, archived: false, artifacts: [{ id: 'a'.repeat(64), sessionId: 'ses_1', messageId: 'm', partId: 'p', position: 0, title: 'Page', kind: 'page', format: 'HTML', origin: 'render.page', createdAt: 1, directory: dir }] });
+    const found = library.list().find(row => row.path === inside), escape = library.list().find(row => row.path === outside);
+    expect(found).toBeTruthy(); expect(escape).toBeUndefined();
+
+    const hidden = await library.remove(['a'.repeat(64)]);
+    expect(hidden.hidden).toEqual(['a'.repeat(64)]); chatHidden = true;
+    expect(library.index(new URLSearchParams({ scope: 'session', session: 'ses_1', size: '12' })).total).toBe(0);
+    const shown = library.index(new URLSearchParams({ scope: 'session', session: 'ses_1', size: '12', hidden: '1' }));
+    expect(shown.total).toBe(1); expect(shown.context.hidden).toBe(1);
+    // The message artifact is untouched on disk-less sources: only hidden.
+    expect(chatHidden && library.hidden.has('a'.repeat(64))).toBe(true);
+    library.setHidden([...library.hiddenList()]);
+    expect(library.hiddenList()).toEqual(['a'.repeat(64)]);
+
+    const removed = await library.remove([found!.id]);
+    expect(removed.deleted).toEqual([found!.id]);
+    await expect(readFile(inside)).rejects.toThrow();
+  } finally { await rm(dir, { recursive: true, force: true }); await rm(join(tmpdir(), 'gallery-outside.md'), { force: true }); }
+});
+
 test('scoped index separates managed Chats from unknown sources and replaces pages', async () => {
   const dir = await mkdtemp(join(tmpdir(), 'gallery-scopes-'));
   try {

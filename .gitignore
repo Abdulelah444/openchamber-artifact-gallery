@@ -1,7 +1,8 @@
 # Built panel/service entries are tracked for installation by repository URL.
 docs/.vitepress/cache/
 docs/.vitepress/dist/
-node_modules/
+node_modules
+graphify-out//
 dist/
 test-results/
 .DS_Store

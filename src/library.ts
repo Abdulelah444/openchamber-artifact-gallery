@@ -1,5 +1,5 @@
 import { Service } from '@opencode/client/service';
-import { open, readdir, stat } from 'node:fs/promises';
+import { open, readdir, stat, unlink } from 'node:fs/promises';
 import { basename, extname, join, resolve } from 'node:path';
 import { homedir } from 'node:os';
 import { createHash, randomUUID } from 'node:crypto';
@@ -22,7 +22,7 @@ export class GalleryError extends Error { constructor(public status: number, mes
 const normalized = (path: string) => path.replace(/\\/g, '/').replace(/\/+$/, '') || '/';
 const within = (directory: string | null, root: string) => Boolean(directory && !directory.split(/[\\/]/).some(p => p === '.' || p === '..') && (normalized(directory) === normalized(root) || normalized(directory).startsWith(normalized(root).replace(/\/$/, '') + '/')));
 
-type DiscoveredFile = { path: string; mtime: number };
+type DiscoveredFile = { path: string; mtime: number; size: number };
 /** Depth-first walk bounded in depth and breadth so one huge tree cannot stall a refresh. */
 async function walkArtifacts(root: string): Promise<DiscoveredFile[]> {
   const found: DiscoveredFile[] = [];
@@ -39,7 +39,7 @@ async function walkArtifacts(root: string): Promise<DiscoveredFile[]> {
       if (!entry.isFile()) continue;
       const extension = extname(entry.name).slice(1).toLowerCase();
       if (!scanExtensions.has(extension)) continue;
-      try { const info = await stat(full); if (info.isFile() && info.size <= 25 * 1024 * 1024) found.push({ path: resolve(full), mtime: info.mtimeMs }); } catch { /* unreadable */ }
+      try { const info = await stat(full); if (info.isFile() && info.size <= 25 * 1024 * 1024) found.push({ path: resolve(full), mtime: info.mtimeMs, size: info.size }); } catch { /* unreadable */ }
     }
   };
   await visit(root, 0);
@@ -107,6 +107,13 @@ export async function scanSession(info: any, api: ReadApi): Promise<Session> {
   return { id: info.id, title: info.title || info.id, directory: info.location?.directory ?? null, projectId: info.projectID ?? null, updated: info.time?.updated ?? 0, archived: info.archived === true || info.archivedAt != null, artifacts };
 }
 
+/** How the gallery orders rows; the service validates the value. */
+export const SORTS = ['recent', 'oldest', 'name', 'name-desc', 'size', 'type'] as const;
+export type Sort = typeof SORTS[number];
+
+/** One gallery row: an artifact plus the space/session context the panel shows. */
+export type Row = Artifact & { size: number | null; sessionTitle: string; sessionArchived: boolean; repo: string | null; projectId: string; projectName: string; spaceKind: Space['kind'] };
+
 export class Library {
   sessions = new Map<string, Session>();
   projects: Project[] = [];
@@ -119,7 +126,17 @@ export class Library {
   private api: ReadApi | null = null;
   private restored = false;
   private resources = new Map<string, { bytes: Buffer; mime: string; expires: number }>();
+  /** Message-backed artifacts the user removed from the gallery. Persisted by the panel. */
+  hidden = new Set<string>();
+  /** Byte size of discovered files, measured once during the crawl (absent until then). */
+  private sizes = new Map<string, number>();
   constructor(private connect = localReader, private readChats = readChatRoots) {}
+  /** Restore the user's hidden list alongside the cache; ids are opaque hashes. */
+  setHidden(value: unknown) {
+    if (!Array.isArray(value)) return;
+    this.hidden = new Set(value.filter((id): id is string => typeof id === 'string' && /^[a-f0-9]{64}$/.test(id)).slice(0, 20_000));
+  }
+  hiddenList() { return [...this.hidden]; }
   restore(value: unknown) {
     const saved = validateSnapshot(value);
     if (this.restored || this.job || this.classifying || this.sessions.size) return;
@@ -213,6 +230,7 @@ export class Library {
           title: basename(path), kind, format: format.toUpperCase(), origin: 'Fichier du projet',
           createdAt: file.mtime, directory: root, path, discovered: true,
         };
+        this.sizes.set(artifact.id, file.size);
         const bucket = discovered.get(sessionId) ?? [];
         bucket.push(artifact); discovered.set(sessionId, bucket);
       }
@@ -237,33 +255,81 @@ export class Library {
       const directory = artifact.directory ?? session.directory;
       const space = this.space(directory, session.projectId);
       const repo = session.projectId ? this.roots.get(session.projectId) ?? null : null;
-      return { ...artifact, sessionTitle: session.title, sessionArchived: session.archived === true, repo, projectId: space.id, projectName: space.name, spaceKind: space.kind };
-    })).sort((a, b) => Number(Boolean(a.discovered)) - Number(Boolean(b.discovered)) || b.createdAt - a.createdAt || a.id.localeCompare(b.id));
+      return { ...artifact, size: this.sizes.get(artifact.id) ?? null, sessionTitle: session.title, sessionArchived: session.archived === true, repo, projectId: space.id, projectName: space.name, spaceKind: space.kind };
+    }));
+  }
+  private order(rows: Row[], sort: Sort): Row[] {
+    const byName = (a: Row, b: Row) => a.title.localeCompare(b.title, 'fr', { numeric: true }) || a.id.localeCompare(b.id);
+    const stable = rows.slice().sort(byName);
+    switch (sort) {
+      case 'oldest': return stable.sort((a, b) => a.createdAt - b.createdAt || byName(a, b));
+      case 'name': return stable;
+      case 'name-desc': return stable.reverse();
+      case 'size': return stable.sort((a, b) => (b.size ?? -1) - (a.size ?? -1) || byName(a, b));
+      case 'type': return stable.sort((a, b) => a.kind.localeCompare(b.kind) || a.format.localeCompare(b.format) || byName(a, b));
+      default: return stable.sort((a, b) => Number(Boolean(a.discovered)) - Number(Boolean(b.discovered)) || b.createdAt - a.createdAt || byName(a, b));
+    }
   }
   index(params: URLSearchParams) {
     const scope = params.get('scope') ?? 'all', project = params.get('project') ?? 'all', kind = params.get('type') ?? 'all';
+    const sort = (params.get('sort') ?? 'recent') as Sort, showHidden = params.get('hidden') === '1';
     const sessionId = params.get('session'), directory = params.get('directory'), query = (params.get('q') ?? '').trim().toLocaleLowerCase('fr');
     const size = Number(params.get('size') ?? 12), requestedPage = Number(params.get('page') ?? 1);
-    if (!['session', 'space', 'all'].includes(scope) || ![12, 24].includes(size) || !Number.isSafeInteger(requestedPage) || requestedPage < 1 || query.length > 1000 || (directory?.length ?? 0) > 4096 || (sessionId && !/^ses_[a-zA-Z0-9_-]+$/.test(sessionId))) throw new GalleryError(400, 'Filtres invalides.');
+    if (!['session', 'space', 'all'].includes(scope) || !SORTS.includes(sort) || ![12, 24].includes(size) || !Number.isSafeInteger(requestedPage) || requestedPage < 1 || query.length > 1000 || (directory?.length ?? 0) > 4096 || (sessionId && !/^ses_[a-zA-Z0-9_-]+$/.test(sessionId))) throw new GalleryError(400, 'Filtres invalides.');
     const active = sessionId ? this.sessions.get(sessionId) : undefined;
-    const space = this.space(active ? active.directory : directory, active?.projectId), rows = this.list();
+    // Hidden rows only count toward visible totals when the user asked to see them.
+    const rows = this.list().filter(row => showHidden || !this.hidden.has(row.id)), space = this.space(active ? active.directory : directory, active?.projectId);
     const spaces = new Map<string, Space & { count: number }>(this.projects.map(p => [p.id, { id: p.id, name: p.name, kind: 'project', count: 0 }]));
     for (const row of rows) {
       const existing = spaces.get(row.projectId) ?? { id: row.projectId, name: row.projectName, kind: row.spaceKind, count: 0 };
       existing.count++; spaces.set(existing.id, existing);
     }
-    const context = { space, sessionCount: rows.filter(row => row.sessionId === sessionId).length, spaceCount: space.kind === 'unknown' ? 0 : rows.filter(row => row.projectId === space.id).length, total: rows.length, projectsCount: rows.filter(row => row.spaceKind === 'project').length };
-    const matches = rows.filter(row => (scope === 'session' ? row.sessionId === sessionId : scope === 'space' ? space.kind !== 'unknown' && row.projectId === space.id : project === 'all' || (project === 'projects' ? row.spaceKind === 'project' : row.projectId === project))
+    const hiddenCount = this.hidden.size;
+    const context = { space, sessionCount: rows.filter(row => row.sessionId === sessionId).length, spaceCount: space.kind === 'unknown' ? 0 : rows.filter(row => row.projectId === space.id).length, total: rows.length, projectsCount: rows.filter(row => row.spaceKind === 'project').length, hidden: hiddenCount, showHidden };
+    const matched = rows.filter(row => (scope === 'session' ? row.sessionId === sessionId : scope === 'space' ? space.kind !== 'unknown' && row.projectId === space.id : project === 'all' || (project === 'projects' ? row.spaceKind === 'project' : row.projectId === project))
       && (kind === 'all' || row.kind === kind) && (!query || [row.title, row.projectName, row.sessionTitle, row.path ?? ''].join(' ').toLocaleLowerCase('fr').includes(query)));
+    // Hidden rows keep their place in their own bucket so restoring does not reshuffle.
+    const matches = this.order(matched.filter(row => !this.hidden.has(row.id)), sort).concat(this.order(matched.filter(row => this.hidden.has(row.id)), sort));
     const total = matches.length, pages = Math.max(1, Math.ceil(total / size)), page = Math.min(requestedPage, pages);
     const artifacts = matches.slice((page - 1) * size, page * size), catalog = [...spaces.values()].sort((a, b) => a.name.localeCompare(b.name, 'fr'));
-    const version = createHash('sha256').update(JSON.stringify([scope, project, sessionId, directory, query, kind, size, page, total, artifacts, catalog, context])).digest('hex');
+    const version = createHash('sha256').update(JSON.stringify([scope, project, sessionId, directory, query, kind, sort, showHidden, size, page, total, artifacts, catalog, context])).digest('hex');
     const unchanged = params.get('version') === version;
     return { version, unchanged, page, pages, total, context, status: this.status, warning: this.classificationWarning, ...(unchanged ? {} : { artifacts, spaces: catalog }) };
   }
   private find(id: string) {
     for (const session of this.sessions.values()) { const artifact = session.artifacts.find(a => a.id === id); if (artifact) return artifact; }
     throw new GalleryError(404, 'Référence introuvable.');
+  }
+  /**
+   * Remove rows from the gallery. Message-backed artifacts are only hidden — the
+   * chat message still holds them, and hiding is persisted by the panel. Files
+   * discovered on disk are the user's own files, so this deletes them for real.
+   */
+  async remove(ids: string[]) {
+    const hidden: string[] = [], deleted: string[] = [], failed: { id: string; error: string }[] = [];
+    for (const id of [...new Set(ids)]) {
+      let artifact: Artifact;
+      try { artifact = this.find(id); } catch { failed.push({ id, error: 'Référence introuvable.' }); continue; }
+      if (!artifact.discovered) {
+        // Never hide a file-backed row that came from a message: only crawling owns disk paths.
+        this.hidden.add(id); hidden.push(id); continue;
+      }
+      if (!artifact.path) { failed.push({ id, error: 'Source indisponible.' }); continue; }
+      if (!this.withinProject(artifact.path)) { failed.push({ id, error: 'Fichier hors des racines explorées ; suppression refusée.' }); continue; }
+      try {
+        await unlink(artifact.path); deleted.push(id);
+        for (const session of this.sessions.values()) if (session.directoryFiles) session.artifacts = session.artifacts.filter(a => a.id !== id);
+        this.sizes.delete(id);
+      } catch (error: any) { failed.push({ id, error: error?.code === 'ENOENT' ? 'Fichier déjà absent.' : 'Suppression refusée par le système.' }); }
+    }
+    // Drop now-empty filesystem buckets so an empty project heading does not linger.
+    for (const [key, session] of [...this.sessions]) if (session.directoryFiles && !session.artifacts.length) this.sessions.delete(key);
+    return { hidden, deleted, failed, hiddenList: [...this.hidden] };
+  }
+  /** Refuse to unlink anything outside the directories the crawler itself walked. */
+  private withinProject(path: string): boolean {
+    const target = normalized(path);
+    return this.crawlRoots().some(root => within(target, root));
   }
   item(id: string) {
     const item = this.list().find(row => row.id === id);
